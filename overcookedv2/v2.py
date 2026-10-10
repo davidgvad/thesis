@@ -37,6 +37,8 @@ class OvercookedEnv:
         sample_recipe_on_delivery=False,
         random_reset=False,
         random_agent_positions=False,
+        agent_view_size=None,
+        indicate_successful_delivery=False,
     ):
         self.layout = layout
         self.max_steps = max_steps
@@ -45,6 +47,11 @@ class OvercookedEnv:
         self.sample_recipe_on_delivery = sample_recipe_on_delivery
         self.random_reset = random_reset
         self.random_agent_positions = random_agent_positions
+        self.agent_view_size = agent_view_size  # Radius; None gives the full map.
+        self.indicate_successful_delivery = indicate_successful_delivery
+
+        if agent_view_size is not None and agent_view_size < 0:
+            raise ValueError("agent_view_size must be nonnegative or None.")
 
         self.delta = torch.tensor(
             [
@@ -75,6 +82,14 @@ class OvercookedEnv:
             device=layout.grid.device,
         )
         self.ingredient_values = 4 << (2 * ingredient_ids)
+
+        self.obs_channels = 25 + 5 * self.num_ingredients
+        self.obs_channels += int(self.indicate_successful_delivery)
+        view_height, view_width = layout.grid.shape[1:]
+        if agent_view_size is not None:
+            view_height = min(view_height, 2 * agent_view_size + 1)
+            view_width = min(view_width, 2 * agent_view_size + 1)
+        self.obs_shape = (view_height, view_width, self.obs_channels)
 
     def _encode_ingredients(self, ingredient_ids):
         values = self.ingredient_values[ingredient_ids]
@@ -131,6 +146,93 @@ class OvercookedEnv:
             return self._randomize_positions(state, batch_indices)
 
         return state
+
+    def _decode_items(self, items):
+        """Encoded items -> [..., plate, cooked, ingredient counts]."""
+        plate = (items & int(D.PLATE))[..., None]
+        cooked = ((items >> 1) & 1)[..., None]
+        counts = (items[..., None] // self.ingredient_values[:self.num_ingredients]) % 4
+        return torch.cat([plate, cooked, counts], dim=-1).float()
+
+    def get_obs(self, state):
+        """Return float32 spatial observations: [B, N, view_H, view_W, C].
+
+        Order: SELF, OTHERS, STATIC, PILES, CONTENTS, RECIPE, TIMER,
+        then optional delivery feedback. C = 25 + 5 * I (+1 for feedback).
+        Each agent block contains position, UP/DOWN/LEFT/RIGHT, and inventory.
+        """
+        B, H, W, _ = state.grid.shape
+        N = state.agents.pos.shape[1]
+        I = self.num_ingredients
+        device = state.grid.device
+        batch = torch.arange(B, device=device)
+        agents = torch.arange(N, device=device)
+        static = state.grid[..., 0]
+        timers = state.grid[..., 2]
+
+        # Put each agent's features at its cell, across all kitchens at once.
+        directions = (
+            state.agents.direction[..., None] == torch.arange(4, device=device)
+        ).float()
+        features = torch.cat([
+            torch.ones((B, N, 1), dtype=torch.float32, device=device),
+            directions,
+            self._decode_items(state.agents.inventory),
+        ], dim=-1)
+
+        agent_channels = 7 + I
+        self_maps = torch.zeros(
+            (B, N, H, W, agent_channels), dtype=torch.float32, device=device
+        )
+        self_maps[
+            batch[:, None], agents[None, :],
+            state.agents.pos[..., 0], state.agents.pos[..., 1],
+        ] = features
+        other_maps = self_maps.sum(dim=1, keepdim=True) - self_maps
+
+        # Maps that every agent shares.
+        static_types = torch.tensor([
+            int(S.WALL), int(S.GOAL), int(S.POT),
+            int(S.RECIPE_INDICATOR), int(S.BUTTON_RECIPE_INDICATOR),
+            int(S.PLATE_PILE),
+        ], device=device)
+        static_maps = (static[..., None] == static_types).float()
+        pile_types = int(S.INGREDIENT_PILE_BASE) + torch.arange(I, device=device)
+        pile_maps = (static[..., None] == pile_types).float()
+        content_maps = self._decode_items(state.grid[..., 1])
+
+        display_active = (static == int(S.RECIPE_INDICATOR)) | (
+            (static == int(S.BUTTON_RECIPE_INDICATOR)) & (timers > 0)
+        )
+        displayed_recipe = torch.where(display_active, state.recipe[:, None, None], 0)
+        recipe_maps = self._decode_items(displayed_recipe)
+        pot_timers = torch.where(static == int(S.POT), timers, 0)[..., None].float()
+
+        shared_parts = [static_maps, pile_maps, content_maps, recipe_maps, pot_timers]
+        if self.indicate_successful_delivery:
+            delivery = (static == int(S.GOAL)) & state.new_correct_delivery[:, None, None]
+            shared_parts.append(delivery[..., None].float())
+        shared_maps = torch.cat(shared_parts, dim=-1)
+        shared_maps = shared_maps[:, None].expand(-1, N, -1, -1, -1)
+        obs = torch.cat([self_maps, other_maps, shared_maps], dim=-1)
+
+        # A centered crop for every agent; mask outside-map cells to zero.
+        if self.agent_view_size is not None:
+            view_H, view_W, _ = self.obs_shape
+            rows = state.agents.pos[..., 0, None, None] + (
+                torch.arange(view_H, device=device)[None, None, :, None] - view_H // 2
+            )
+            cols = state.agents.pos[..., 1, None, None] + (
+                torch.arange(view_W, device=device)[None, None, None, :] - view_W // 2
+            )
+            inside = (rows >= 0) & (rows < H) & (cols >= 0) & (cols < W)
+            obs = obs[
+                batch[:, None, None, None], agents[None, :, None, None],
+                rows.clamp(0, H - 1), cols.clamp(0, W - 1),
+            ]
+            obs = obs * inside[..., None]
+
+        return obs
 
     def _find_rooms(self, static_grids):
         """Find connected floor areas, this runs once in __init__."""
@@ -442,11 +544,13 @@ class OvercookedEnv:
 
         Returns:
             next_state
+            next_obs:       [B, N, view_H, view_W, C]
             reward:         [B]
             shaped_rewards: [B, N]
             done:           [B], True for episodes ending on this step
 
         Finished kitchens are reset in next_state using the configured mode.
+        next_obs describes next_state after those resets.
         done still reports the episode boundary; rewards belong to the ending step.
         """
         grid = state.grid.clone()
@@ -1034,4 +1138,5 @@ class OvercookedEnv:
             next_state.terminal[reset_indices] = False
             next_state.new_correct_delivery[reset_indices] = False
 
-        return next_state, reward, shaped_rewards, done
+        next_obs = self.get_obs(next_state)
+        return next_state, next_obs, reward, shaped_rewards, done
