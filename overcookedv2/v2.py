@@ -154,12 +154,13 @@ class OvercookedEnv:
         counts = (items[..., None] // self.ingredient_values[:self.num_ingredients]) % 4
         return torch.cat([plate, cooked, counts], dim=-1).float()
 
-    def get_obs(self, state):
+    def get_obs(self, state, full_grid=False):
         """Return float32 spatial observations: [B, N, view_H, view_W, C].
 
         Order: SELF, OTHERS, STATIC, PILES, CONTENTS, RECIPE, TIMER,
         then optional delivery feedback. C = 25 + 5 * I (+1 for feedback).
         Each agent block contains position, UP/DOWN/LEFT/RIGHT, and inventory.
+        full_grid=True skips cropping for centralized-critic inputs.
         """
         B, H, W, _ = state.grid.shape
         N = state.agents.pos.shape[1]
@@ -217,7 +218,7 @@ class OvercookedEnv:
         obs = torch.cat([self_maps, other_maps, shared_maps], dim=-1)
 
         # A centered crop for every agent; mask outside-map cells to zero.
-        if self.agent_view_size is not None:
+        if self.agent_view_size is not None and not full_grid:
             view_H, view_W, _ = self.obs_shape
             rows = state.agents.pos[..., 0, None, None] + (
                 torch.arange(view_H, device=device)[None, None, :, None] - view_H // 2
