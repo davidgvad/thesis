@@ -161,7 +161,6 @@ class AssemblyLineTeammate:
         inventory_counts = counts(inventory)          # [B,N,10]
         raw_inventory = (inventory != 0) & ((inventory & 3) == 0)
         carried = (inventory_counts * raw_inventory[..., None]).sum(dim=1)
-        reserved = (inventory_counts[:, :agent_index] * raw_inventory[:, :agent_index, None]).sum(dim=1)
         cooked = self._pots & ((items & int(D.COOKED)) != 0)
         hot = self._pots & ((timers > 0) | cooked)
         ready = self._pots & ~hot & (items == state.recipe[:, None, None])
@@ -186,7 +185,7 @@ class AssemblyLineTeammate:
         plate_action = torch.where(plate_action >= 0, plate_action, wait)
         plate_action = torch.where(plate_action >= 0, plate_action, drop)
         useful_pots = filling & (
-            contents + inventory_counts[:, agent_index, None, None] + reserved[:, None, None]
+            contents + inventory_counts[:, agent_index, None, None]
             <= required[:, None, None]
         ).all(dim=-1)
         ingredient_action = go(useful_pots) if self.role != "deliverer" else torch.full_like(held, -1)
@@ -240,7 +239,7 @@ class AssemblyLineTeammate:
         if agent_index > 0:
             next_position = position + env.delta[action]
             near_earlier = ((next_position[:, None] - positions[:, :agent_index]).abs().sum(dim=-1) <= 1).any(dim=1)
-            yield_turn = (action < int(Action.STAY)) & (state.time % 2 == 1) & near_earlier
+            yield_turn = (action < int(Action.STAY)) & (state.time % 2 == 1) & near_earlier # Odd timestamps, to not get stuck forever
             action = action.masked_fill(yield_turn, int(Action.STAY))
 
         # Empty agents give nearby ingredient/dish carriers room to pass.
