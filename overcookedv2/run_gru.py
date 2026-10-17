@@ -21,7 +21,13 @@ from v2 import OvercookedEnv
 # A small example kitchen for checking the launcher, not the thesis benchmark.
 # Use --layout to supply your actual kitchen and possible recipes as JSON.
 EXAMPLE_LAYOUT = {
-    "grid": "WWWWWWW\nW0 P BW\nWA R AW\nW  X  W\nWWWWWWW",
+    "grid": "
+    WWWWWWWWW
+    O WXWOW X
+    W   P   W
+    W A PA  W
+    WWWBWBWWW
+    ",
     "recipes": [[0, 0, 0]],
 }
 
@@ -57,6 +63,7 @@ def run_worker(worker_index, args, init_method=None):
         layout.recipes = layout.recipes.to(device)
         env = OvercookedEnv(
             layout, max_steps=args.max_steps, agent_view_size=args.view_radius,
+            random_reset=args.random_reset,
         )
         teammate = AssemblyLineTeammate(role=args.role)
 
@@ -102,6 +109,8 @@ def main():
     parser.add_argument("--max-grad-norm", type=float, help="Gradient norm clipping limit.")
     parser.add_argument("--epochs", type=int, help="PPO passes over each rollout.")
     parser.add_argument("--print-every", type=int, help="Print kitchen 0 every N rollout steps; 0 disables it.")
+    parser.add_argument("--random-reset", action=argparse.BooleanOptionalAction,
+                        help="Randomize agent positions/directions, inventories, and pot/counter contents on reset.")
     # Defaults live only in PPOConfig. CLI values replace the selected fields.
     parser.set_defaults(**asdict(PPOConfig()))
     args = PPOConfig(**vars(parser.parse_args()))

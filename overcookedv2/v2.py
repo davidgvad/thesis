@@ -34,11 +34,11 @@ class OvercookedEnv:
         max_steps=400,
         cook_time=20,
         negative_rewards=False,
-        sample_recipe_on_delivery=False,
+        sample_recipe_on_delivery=True,
         random_reset=False,
         random_agent_positions=False,
         agent_view_size=None,
-        indicate_successful_delivery=False,
+        indicate_successful_delivery=True,
     ):
         self.layout = layout
         self.max_steps = max_steps

@@ -33,10 +33,11 @@ class PPOConfig:
     cpu_threads: int = 4
     role: str = "flexible"
     layout: Optional[str] = None  # None selects the launcher's example kitchen.
-    view_radius: Optional[int] = None  # None gives the actor the full map.
+    view_radius: Optional[int] = 3 # None gives the actor the full map.
     log_dir: str = "runs/gru"
     timeout_minutes: int = 10
     print_every: int = 0  # Print kitchen 0 every N rollout steps; 0 disables it.
+    random_reset: bool = True  # Sample positions, inventories, and kitchen contents on reset.
 
 
 def print_kitchen(state, ego_index=0, actions=None, reward=None, done=None):

@@ -223,6 +223,14 @@ actual kitchen with `--layout path/to/kitchen.json`. The JSON structure is:
 {"grid": "WWWWWWW\nW0 P BW\nWA R AW\nW  X  W\nWWWWWWW", "recipes": [[0, 0, 0]]}
 ```
 
+Training uses `PPOConfig.random_reset = True` by default. Each rollout starts
+with freshly sampled agent positions/directions, inventories, and pot/counter
+contents, using the environment's existing random reset. The map stays fixed,
+and agents stay in their original rooms. Automatic resets at episode end use
+the same mode. Use `--no-random-reset` for the original empty starting state,
+or `--random-reset` to explicitly enable randomization. The run seed controls
+the sampling sequence, and the chosen setting is saved in the configuration.
+
 `grid` uses the symbols from `Layout.from_string` and must contain two agents.
 `recipes` lists possible three-ingredient recipes. Use `--role runner`,
 `--role deliverer`, or `--role flexible` (default) to choose the fixed teammate.
