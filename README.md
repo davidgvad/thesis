@@ -143,7 +143,7 @@ The launcher reads those defaults and lets command-line arguments override them.
 For example, `--learning-rate 0.0001 --epochs 4 --batch-size 128` changes only
 those three settings. Omitted arguments keep their `PPOConfig` defaults. Run
 `python3 overcookedv2/run_gru.py --help` to list every option and its default.
-The current default is 10 PPO epochs per rollout; `--updates` separately controls
+The current default is 4 PPO epochs per rollout; `--updates` separately controls
 how many collect-rollout/train cycles to run. The resolved settings are saved
 with the run, so CLI overrides are recorded too.
 
@@ -207,6 +207,30 @@ The step count is `updates * batch_size * max_steps` across all GPUs. With a
 environment steps for the shared policy. Start with the shorter pilot to measure
 speed and memory first. Increasing the GPU count does not automatically improve
 throughput; the small networks and communication overhead need benchmarking.
+
+The default training budget is now 586 updates: `586 * 128 * 400 = 30,003,200`
+environment steps per run. This matches the approximate 30M-step scale used for
+several coordination tasks in the [OvercookedV2 paper, Appendix D.2](https://arxiv.org/html/2503.17821v1#A4.SS2).
+The paper also uses 4 PPO epochs, 10 independent training seeds, and 500
+evaluation episodes per policy pairing. Matching the step budget and epoch
+count does not reproduce its full protocol; our batching, teammate training,
+task, and reset distribution differ.
+
+For the planned two-architecture by two-coverage thesis comparison, 10 seeds
+per condition would mean 40 main runs (about 1.2B total training steps), versus
+12 runs (about 360M steps) with the proposal's 3 seeds. These are independent
+training repetitions, not the per-worker sampling seeds. Specialist-reference
+training, tuning, and evaluation add to this budget. The population comparison,
+second architecture, and frozen evaluation protocol remain to be implemented;
+the current fixed-teammate example is a training pilot.
+
+The final evaluation target is 500 episodes per trained seed and held-out
+teammate, using the same evaluation distribution across conditions. Keep test
+teammates separate from validation/tuning, compare untrained/random ego and
+specialist baselines, report results by recipe/teammate, and report uncertainty
+across independent training seeds. Extra evaluation episodes do not replace
+independent training seeds. For the current runner, `--updates 10` still gives
+a short smoke test instead of the longer default run.
 
 GPU indices refer to the GPUs visible to your job. The launcher does not reserve
 GPUs or CPU cores. `--cpu-threads` sets PyTorch CPU threads **per worker**; it is
