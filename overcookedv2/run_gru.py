@@ -101,6 +101,7 @@ def main():
     parser.add_argument("--value-coef", type=float, help="Critic loss weight.")
     parser.add_argument("--max-grad-norm", type=float, help="Gradient norm clipping limit.")
     parser.add_argument("--epochs", type=int, help="PPO passes over each rollout.")
+    parser.add_argument("--print-every", type=int, help="Print kitchen 0 every N rollout steps; 0 disables it.")
     # Defaults live only in PPOConfig. CLI values replace the selected fields.
     parser.set_defaults(**asdict(PPOConfig()))
     args = PPOConfig(**vars(parser.parse_args()))
@@ -110,6 +111,8 @@ def main():
             parser.error(f"{name.replace('_', '-')} must be positive.")
     if args.view_radius is not None and args.view_radius < 0:
         parser.error("view-radius must be nonnegative.")
+    if args.print_every < 0:
+        parser.error("print-every must be nonnegative.")
     workers = len(args.devices)
     # Equal splits give every worker the same number of backward calls and the
     # same weight in the averaged gradients, including the final minibatch.

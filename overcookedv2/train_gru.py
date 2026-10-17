@@ -71,7 +71,12 @@ def train(
     history = []
     for update in range(1, updates + 1):
         start = time.perf_counter()
-        rollout = collect_rollout(env, actor, critic, teammate)
+        if is_main and config.print_every:
+            print(f"\nRollout for update {update}", flush=True)
+        rollout = collect_rollout(
+            env, actor, critic, teammate,
+            print_every=config.print_every if is_main else 0,
+        )
         metrics = ppo_update(
             actor_for_update, critic_for_update, actor_optimizer, critic_optimizer,
             rollout, config, distributed=distributed,

@@ -177,6 +177,18 @@ kitchens' timesteps ordered; each worker shuffles its own kitchen sequences.
 Advantages use the mean and standard deviation across the **whole** rollout,
 not a separate normalization per GPU.
 
+To watch a kitchen in the terminal, add `--print-every 1` (every rollout step)
+or `--print-every 10` (every tenth step). Printing is off by default, controlled
+by `PPOConfig.print_every = 0`. Only kitchen 0 on worker 0 is shown, including
+the initial grid, sampled snapshots, and the final snapshot of each rollout.
+Each snapshot lists both agents' latest actions, positions, facing directions,
+inventories, recipe, cell contents/timers, and team reward. `E` is the ego and
+`T` is the teammate; the remaining symbols have a printed legend. At episode
+end, `env.step()` returns an automatically reset kitchen, which is labelled in
+the output. This is a full-state debug view, even when the actor has a local
+view. Displaying GPU tensors in the terminal slows training; use `0` for timed
+experiments. The normal combined metrics and saved logs still work.
+
 There is one experiment seed (`--seed 0` by default), with worker sampling seeds
 `seed + worker_index` so workers collect different trajectories. These worker
 seeds are NOT independent experimental repetitions: all data trains the same
