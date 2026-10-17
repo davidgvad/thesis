@@ -1,6 +1,8 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 import torch
+import torch.distributed as dist
 from torch.distributions import Categorical
 from torch.nn.utils import clip_grad_norm_
 
@@ -9,15 +11,31 @@ from commons import StaticObject as S
 
 @dataclass
 class PPOConfig:
+    """All launcher and PPO defaults; CLI arguments can override each field."""
+
+    # PPO settings.
     learning_rate: float = 2.5e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip: float = 0.2
     entropy_coef: float = 0.01
     value_coef: float = 0.5
-    max_grad_norm: float = 0.25
-    epochs: int = 4
-    minibatch_size: int = 4  # Kitchens/episode sequences, not timesteps.
+    max_grad_norm: float = 0.4
+    epochs: int = 10
+    minibatch_size: int = 16  # Total kitchen sequences per step, across all workers.
+
+    # Run settings. Batch sizes are totals across all workers.
+    devices: list[str] = field(default_factory=lambda: ["cpu"])
+    seed: int = 0
+    batch_size: int = 128
+    updates: int = 10
+    max_steps: int = 400
+    cpu_threads: int = 4
+    role: str = "flexible"
+    layout: Optional[str] = None  # None selects the launcher's example kitchen.
+    view_radius: Optional[int] = None  # None gives the actor the full map.
+    log_dir: str = "runs/gru"
+    timeout_minutes: int = 10
 
 
 def get_critic_obs(env, state, ego_index=0):
@@ -134,23 +152,51 @@ def compute_gae(rewards, values, done, next_value, gamma=0.99, gae_lambda=0.95):
     return advantages.detach(), (advantages + values).detach()
 
 
-def ppo_update(actor, critic, actor_optimizer, critic_optimizer, rollout, config):
-    """Shuffle kitchens; keep each complete timestep sequence in order."""
+def normalize_advantages(advantages, distributed=False):
+    """Use one mean/std for the entire rollout, including other workers."""
+    if not distributed:
+        return (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+
+    # all_reduce adds together each worker's numbers and returns the sum to all.
+    totals = torch.stack([advantages.sum(), advantages.new_tensor(advantages.numel())])
+    dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    mean = totals[0] / totals[1]
+    squared_error = (advantages - mean).square().sum()
+    dist.all_reduce(squared_error, op=dist.ReduceOp.SUM)
+    std = (squared_error / totals[1]).sqrt()
+    return (advantages - mean) / (std + 1e-8)
+
+
+def ppo_update(
+    actor, critic, actor_optimizer, critic_optimizer, rollout, config,
+    distributed=False,
+):
+    """Keep sequences ordered; DDP averages gradients during backward().
+
+    In distributed mode, every worker must have the same rollout shape/config.
+    actor and critic must be DistributedDataParallel wrappers in that mode.
+    """
+    minibatch_size = config.minibatch_size
+    if minibatch_size < 1 or config.epochs < 1:
+        raise ValueError("minibatch_size and epochs must be positive.")
+    if distributed:
+        if minibatch_size % dist.get_world_size() != 0:
+            raise ValueError("minibatch_size must divide evenly across workers.")
+        # Each worker handles only its share of the total minibatch.
+        minibatch_size //= dist.get_world_size()
     advantages, targets = compute_gae(
         rollout["rewards"], rollout["values"], rollout["done"], rollout["next_value"],
         config.gamma, config.gae_lambda,
     )
-    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+    advantages = normalize_advantages(advantages, distributed)
     batch_size = advantages.shape[1]
-    if config.minibatch_size < 1 or config.epochs < 1:
-        raise ValueError("minibatch_size and epochs must be positive.")
     totals = {"actor_loss": 0.0, "critic_loss": 0.0, "entropy": 0.0}
     count = 0
 
     for _ in range(config.epochs):
         order = torch.randperm(batch_size, device=advantages.device)
-        for start in range(0, batch_size, config.minibatch_size):
-            kitchens = order[start:start + config.minibatch_size]
+        for start in range(0, batch_size, minibatch_size):
+            kitchens = order[start:start + minibatch_size]
             # Leading dimensions remain [T, selected kitchens]. The GRU is
             # recomputed with gradients through the entire sequence, from zero.
             logits, _ = actor(
@@ -175,6 +221,8 @@ def ppo_update(actor, critic, actor_optimizer, critic_optimizer, rollout, config
             critic_loss = (new_values - targets[:, kitchens]).square().mean()
 
             actor_optimizer.zero_grad(set_to_none=True)
+            # With DDP, backward() averages gradients across workers BEFORE
+            # clipping and stepping. Every replica therefore gets the same update.
             (actor_loss - config.entropy_coef * entropy).backward()
             clip_grad_norm_(actor.parameters(), config.max_grad_norm)
             actor_optimizer.step()
@@ -190,4 +238,13 @@ def ppo_update(actor, critic, actor_optimizer, critic_optimizer, rollout, config
             totals["entropy"] += entropy.item() * size
             count += size
 
+    if distributed:
+        # Report losses over all workers, weighted by their kitchen counts.
+        combined = torch.tensor(
+            [totals["actor_loss"], totals["critic_loss"], totals["entropy"], count],
+            device=advantages.device, dtype=torch.float64,
+        )
+        dist.all_reduce(combined, op=dist.ReduceOp.SUM)
+        actor_total, critic_total, entropy_total, count = combined.tolist()
+        totals = {"actor_loss": actor_total, "critic_loss": critic_total, "entropy": entropy_total}
     return {key: value / count for key, value in totals.items()}
