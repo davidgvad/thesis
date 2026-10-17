@@ -21,14 +21,19 @@ from v2 import OvercookedEnv
 # A small example kitchen for checking the launcher, not the thesis benchmark.
 # Use --layout to supply your actual kitchen and possible recipes as JSON.
 EXAMPLE_LAYOUT = {
-    "grid": "
-    WWWWWWWWW
-    O WXWOW X
-    W   P   W
-    W A PA  W
-    WWWBWBWWW
-    ",
-    "recipes": [[0, 0, 0]],
+    "grid": (
+        "WWWWWWWWW\n"
+        "0 WXW1W X\n"
+        "W   P   W\n"
+        "W A PA  W\n"
+        "WWWBWBWWW"
+    ),
+    "recipes": [
+        [0, 0, 0],
+        [0, 0, 1],
+        [0, 1, 1],
+        [1, 1, 1],
+    ],
 }
 
 
