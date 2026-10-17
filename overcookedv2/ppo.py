@@ -31,7 +31,7 @@ class PPOConfig:
     updates: int = 10
     max_steps: int = 400
     cpu_threads: int = 4
-    role: str = "flexible"
+    role: str = "runner"
     layout: Optional[str] = None  # None selects the launcher's example kitchen.
     view_radius: Optional[int] = 3 # None gives the actor the full map.
     log_dir: str = "runs/gru"
