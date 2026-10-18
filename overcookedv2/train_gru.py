@@ -1,4 +1,5 @@
 from dataclasses import asdict
+import copy
 import json
 from pathlib import Path
 import time
@@ -9,6 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from models import GRUActor, CentralCritic
 from ppo import PPOConfig, collect_rollout, ppo_update
+from teammates import AssemblyLineTeammate
 
 
 def train(
@@ -29,6 +31,8 @@ def train(
     seed = config.seed if seed is None else seed
     if updates < 1:
         raise ValueError("updates must be positive.")
+    if config.eval_every < 0 or config.eval_batches < 1:
+        raise ValueError("eval_every must be nonnegative and eval_batches must be positive.")
     rank = dist.get_rank() if distributed else 0
     workers = dist.get_world_size() if distributed else 1
     is_main = rank == 0
@@ -52,6 +56,12 @@ def train(
         torch.manual_seed(seed + rank)
     actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.learning_rate)
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=config.learning_rate)
+
+    # Same layouts and rules, but evaluate cooking from empty kitchens.
+    # The environment keeps state in the rollout, so only these settings differ.
+    eval_env = copy.copy(env)
+    eval_env.random_reset = False
+    eval_env.random_agent_positions = True
 
     if log_dir is not None:
         log_dir = Path(log_dir)
@@ -126,29 +136,86 @@ def train(
                     log_dir / trace_name,
                 )
 
-    if log_dir is not None and is_main:
-        # Save the original models, so loading needs no DDP wrapper or prefix.
-        torch.save({
-            "actor": actor.state_dict(), "critic": critic.state_dict(),
-            "actor_obs_shape": env.obs_shape, "critic_obs_shape": critic_shape,
-            "ppo": asdict(config), "seed": seed, "max_steps": env.max_steps,
-            "workers": workers,
-        }, log_dir / "checkpoint.pt")
+        evaluate_now = config.eval_every > 0 and (
+            update % config.eval_every == 0 or update == updates
+        )
+        if evaluate_now:
+            if is_main:
+                print(f"\nEvaluation at update {update} (empty kitchens, random positions)", flush=True)
+            for role in ("runner", "deliverer", "flexible"):
+                returns = evaluate(
+                    eval_env, actor, critic, AssemblyLineTeammate(role),
+                    episodes=config.eval_batches, seed=config.eval_seed + rank,
+                ).flatten()
+                if distributed:
+                    # Each GPU evaluates its own kitchens, then shares the returns.
+                    returns_by_worker = [torch.empty_like(returns) for _ in range(workers)]
+                    dist.all_gather(returns_by_worker, returns)
+                    returns = torch.cat(returns_by_worker)
+                if is_main:
+                    result = {
+                        "update": update, "env_steps": metrics["env_steps"],
+                        "seed": seed, "eval_seed": config.eval_seed, "workers": workers,
+                        "teammate_role": role, "episodes": returns.numel(),
+                        "mean_return": returns.mean().item(),
+                        "std_return": returns.std(unbiased=False).item(),
+                        "episode_returns": returns.cpu().tolist(),
+                        "reset_mode": "empty_kitchens_random_positions",
+                    }
+                    print(
+                        f"  {role:<10} | Mean return {result['mean_return']:.2f} | "
+                        f"Std {result['std_return']:.2f} | Episodes {result['episodes']}",
+                        flush=True,
+                    )
+                    if log_dir is not None:
+                        with (log_dir / "evaluations.jsonl").open("a") as file:
+                            file.write(json.dumps(result) + "\n")
+        if log_dir is not None and is_main and (evaluate_now or update == updates):
+            # Keep the latest evaluated weights, also saved at the end of training.
+            temporary_checkpoint = log_dir / "checkpoint.tmp"
+            torch.save({
+                "actor": actor.state_dict(), "critic": critic.state_dict(),
+                "actor_obs_shape": env.obs_shape, "critic_obs_shape": critic_shape,
+                "ppo": asdict(config), "seed": seed, "max_steps": env.max_steps,
+                "workers": workers, "update": update, "env_steps": metrics["env_steps"],
+            }, temporary_checkpoint)
+            temporary_checkpoint.replace(log_dir / "checkpoint.pt")
+        if distributed and evaluate_now:
+            # Wait for worker 0 to finish writing the checkpoint.
+            dist.barrier()
 
     return actor, critic, history
 
 
 @torch.no_grad()
-def evaluate(env, actor, critic, teammate, episodes=1, reset_actor_memory=False):
-    """Freeze parameter updates but keep within-episode memory updates."""
+def evaluate(env, actor, critic, teammate, episodes=1, reset_actor_memory=False, seed=None):
+    """Evaluate full batches without changing weights or training randomness.
+
+    episodes is the number of batches: result shape is [episodes, local B].
+    Each rollout starts with fresh recurrent memory; actions remain sampled.
+    """
     if episodes < 1:
         raise ValueError("episodes must be positive.")
+    actor_was_training, critic_was_training = actor.training, critic.training
     actor.eval()
     critic.eval()
-    returns = []
-    for _ in range(episodes):
-        rollout = collect_rollout(
-            env, actor, critic, teammate, reset_actor_memory=reset_actor_memory
-        )
-        returns.append(rollout["rewards"].sum(dim=0))
-    return torch.stack(returns)
+    device = env.layout.grid.device
+    cuda_devices = [device] if device.type == "cuda" else []
+    try:
+        # Restore the training RNG states after evaluation, including on CUDA.
+        with torch.random.fork_rng(devices=cuda_devices):
+            if seed is not None:
+                torch.random.default_generator.manual_seed(seed)
+                if device.type == "cuda":
+                    with torch.cuda.device(device):
+                        torch.cuda.manual_seed(seed)
+            returns = []
+            for _ in range(episodes):
+                rollout = collect_rollout(
+                    env, actor, critic, teammate, reset_actor_memory=reset_actor_memory
+                )
+                returns.append(rollout["rewards"].sum(dim=0))
+            return torch.stack(returns)
+    finally:
+        actor.train(actor_was_training)
+        critic.train(critic_was_training)

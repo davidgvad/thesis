@@ -38,6 +38,9 @@ class PPOConfig:
     timeout_minutes: int = 10
     print_every: int = 100  # Print kitchen 0 every N rollout steps; 0 disables it.
     random_reset: bool = True  # Sample positions, inventories, and kitchen contents on reset.
+    eval_every: int = 20  # Evaluate all three teammate roles; 0 disables evaluation.
+    eval_batches: int = 1  # Full batches per role: 1 means batch_size episodes in total.
+    eval_seed: int = 10000  # Reuse evaluation seeds at every check.
 
 
 def print_kitchen(

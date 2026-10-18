@@ -116,17 +116,22 @@ def main():
     parser.add_argument("--print-every", type=int, help="Show kitchen 0's grid and last actions every N rollout steps; 0 disables it.")
     parser.add_argument("--random-reset", action=argparse.BooleanOptionalAction,
                         help="Randomize agent positions/directions, inventories, and pot/counter contents on reset.")
+    parser.add_argument("--eval-every", type=int, help="Evaluate all three roles every N updates and at the end; 0 disables it.")
+    parser.add_argument("--eval-batches", type=int, help="Evaluation batches per role; episodes = this value times total batch-size.")
+    parser.add_argument("--eval-seed", type=int, help="Separate random seed for repeatable evaluation checks.")
     # Defaults live only in PPOConfig. CLI values replace the selected fields.
     parser.set_defaults(**asdict(PPOConfig()))
     args = PPOConfig(**vars(parser.parse_args()))
 
-    for name in ("batch_size", "updates", "minibatch_size", "max_steps", "cpu_threads", "epochs", "timeout_minutes"):
+    for name in ("batch_size", "updates", "minibatch_size", "max_steps", "cpu_threads", "epochs", "timeout_minutes", "eval_batches"):
         if getattr(args, name) < 1:
             parser.error(f"{name.replace('_', '-')} must be positive.")
     if args.view_radius is not None and args.view_radius < 0:
         parser.error("view-radius must be nonnegative.")
     if args.print_every < 0:
         parser.error("print-every must be nonnegative.")
+    if args.eval_every < 0:
+        parser.error("eval-every must be nonnegative.")
     workers = len(args.devices)
     # Equal splits give every worker the same number of backward calls and the
     # same weight in the averaged gradients, including the final minibatch.

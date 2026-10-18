@@ -116,6 +116,8 @@ the unfinished boundary; this truncates training history. Use full episodes
 for the pilot.
 
 With log_dir set, train writes metrics.jsonl, config.json, and checkpoint.pt.
+Every evaluation check also saves the latest weights to checkpoint.pt, replacing
+the previous checkpoint. This stores model weights, not optimizer/resume state.
 save_traces=True also saves actions, rewards, episode boundaries, actor
 decision representations, critic predictions, and action probabilities as
 PyTorch tensors for representation probes. Optional metadata is saved only
@@ -130,6 +132,45 @@ updates. For an actor-memory ablation:
 
 This resets actor memory at every timestep while preserving its current
 observation and previous-action/reward inputs.
+
+### Periodic evaluation and saved results
+
+By default, training evaluates the frozen policy every 20 updates and at the
+final update against each heuristic role: runner, deliverer, and flexible.
+Evaluation uses empty pots/counters/inventories, random positions/directions
+within each agent's room, the same recipes and other rules, and sampled actor
+actions. Its returns can differ from training returns, which use random kitchen
+contents by default. Evaluation does not update weights or consume the training
+random-number sequence; the model's training/evaluation mode is restored afterward.
+
+All workers participate using the original models (no DDP backward calls).
+Their returns are gathered before worker 0 logs the global scores. Defaults live
+in PPOConfig and can be overridden with:
+
+```text
+--eval-every 20    # 0 disables evaluation
+--eval-batches 1   # per role: eval_batches * global batch_size episodes
+--eval-seed 10000  # fixed evaluation seeds, plus worker rank
+```
+
+With the default 128 kitchens, one check evaluates 128 episodes per role,
+384 episodes total. Use --eval-batches 4 for 512 episodes per role. Every
+checkpoint uses the same evaluation seeds to make progress easier to compare.
+Evaluation interactions are additional work and are not included in env_steps,
+which counts only training interactions.
+
+Inside the run's seed folder, training writes:
+
+- `evaluations.jsonl`: one record per role/check, with update, training steps,
+  mean/std return, episode count, individual returns, seeds, and reset mode.
+- `checkpoint.pt`: the latest evaluated weights, also saved at the final update.
+
+Use `evaluations.jsonl` for your own analysis and plotting. Training only
+records and prints evaluation scores; it does not generate graphs.
+
+These are validation checks against the existing role family, including the
+training teammate's role; they are not a separate held-out thesis test set.
+Episode standard deviations describe variability within one training seed.
 
 The tests also pair complementary heuristics and run a GRU/PPO update with a real
 heuristic teammate. Low/high coverage conditions and held-out teammate groups
@@ -227,8 +268,9 @@ per condition would mean 40 main runs (about 1.2B total training steps), versus
 12 runs (about 360M steps) with the proposal's 3 seeds. These are independent
 training repetitions, not the per-worker sampling seeds. Specialist-reference
 training, tuning, and evaluation add to this budget. The population comparison,
-second architecture, and frozen evaluation protocol remain to be implemented;
-the current fixed-teammate example is a training pilot.
+second architecture, and held-out thesis evaluation protocol remain to be
+implemented; the current fixed-teammate example is a training pilot with
+periodic validation against all three heuristic roles.
 
 The final evaluation target is 500 episodes per trained seed and held-out
 teammate, using the same evaluation distribution across conditions. Keep test
