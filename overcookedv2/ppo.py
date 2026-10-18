@@ -20,15 +20,15 @@ class PPOConfig:
     clip: float = 0.2
     entropy_coef: float = 0.01
     value_coef: float = 0.5
-    max_grad_norm: float = 0.4
+    max_grad_norm: float = 0.25
     epochs: int = 4
-    minibatch_size: int = 16  # Total kitchen sequences per step, across all workers.
+    minibatch_size: int = 4  # Total kitchen sequences per step, across all workers.
 
     # Run settings. Batch sizes are totals across all workers.
     devices: list[str] = field(default_factory=lambda: ["cpu"])
     seed: int = 0
-    batch_size: int = 128
-    updates: int = 586  # 30,003,200 environment steps with batch_size=128, max_steps=400.
+    batch_size: int = 256
+    updates: int = 293  # updates: int = 293  # 30,003,200 steps with batch_size=256, max_steps=400
     max_steps: int = 400
     cpu_threads: int = 4
     role: str = "runner"
