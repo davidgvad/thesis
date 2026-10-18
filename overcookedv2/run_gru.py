@@ -113,7 +113,7 @@ def main():
     parser.add_argument("--value-coef", type=float, help="Critic loss weight.")
     parser.add_argument("--max-grad-norm", type=float, help="Gradient norm clipping limit.")
     parser.add_argument("--epochs", type=int, help="PPO passes over each rollout.")
-    parser.add_argument("--print-every", type=int, help="Print kitchen 0 every N rollout steps; 0 disables it.")
+    parser.add_argument("--print-every", type=int, help="Show kitchen 0's grid and last actions every N rollout steps; 0 disables it.")
     parser.add_argument("--random-reset", action=argparse.BooleanOptionalAction,
                         help="Randomize agent positions/directions, inventories, and pot/counter contents on reset.")
     # Defaults live only in PPOConfig. CLI values replace the selected fields.

@@ -177,17 +177,23 @@ kitchens' timesteps ordered; each worker shuffles its own kitchen sequences.
 Advantages use the mean and standard deviation across the **whole** rollout,
 not a separate normalization per GPU.
 
-To watch a kitchen in the terminal, add `--print-every 1` (every rollout step)
-or `--print-every 10` (every tenth step). Printing is off by default, controlled
-by `PPOConfig.print_every = 0`. Only kitchen 0 on worker 0 is shown, including
-the initial grid, sampled snapshots, and the final snapshot of each rollout.
-Each snapshot lists both agents' latest actions, positions, facing directions,
-inventories, recipe, cell contents/timers, and team reward. `E` is the ego and
-`T` is the teammate; the remaining symbols have a printed legend. At episode
-end, `env.step()` returns an automatically reset kitchen, which is labelled in
-the output. This is a full-state debug view, even when the actor has a local
-view. Displaying GPU tensors in the terminal slows training; use `0` for timed
-experiments. The normal combined metrics and saved logs still work.
+The terminal prints compact update summaries: progress, environment steps,
+mean return, actor/critic losses, entropy, seed, and elapsed update time. The
+individual kitchen returns are saved in `metrics.jsonl`, without printing
+the long list to the terminal.
+
+By default, `PPOConfig.print_every = 100` shows kitchen 0 on worker 0 initially,
+every 100 rollout steps, and at the end of each rollout. Use `--print-every 10`
+for more frequent snapshots, `--print-every 1` for every step, or `--print-every 0`
+to disable them. Each bordered snapshot includes a grid with row/column labels,
+agent facing arrows, a table of latest actions and inventories, the recipe,
+pot/counter contents and timers, last team reward, and that kitchen's running
+return. `E` is the ego and `T` is the teammate; `*` marks an item on a counter.
+Positions show the state after the displayed actions. At episode end, the grid,
+recipe, and inventories instead show the automatic reset, explicitly labelled;
+the actions and return still belong to the episode that just ended. This is a
+full-state debug view, even when the actor has a local view. Displaying GPU
+tensors in the terminal adds overhead; use `--print-every 0` for timed runs.
 
 There is one experiment seed (`--seed 0` by default), with worker sampling seeds
 `seed + worker_index` so workers collect different trajectories. These worker

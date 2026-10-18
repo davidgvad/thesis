@@ -102,7 +102,14 @@ def train(
         })
         history.append(metrics)
         if is_main:
-            print(json.dumps(metrics), flush=True)
+            print(
+                f"\nUpdate {update}/{updates} | Steps {metrics['env_steps']:,} | "
+                f"Mean return {metrics['mean_return']:.2f} | {seconds:.2f}s\n"
+                f"  Actor loss {metrics['actor_loss']:.5f} | "
+                f"Critic loss {metrics['critic_loss']:.4f} | "
+                f"Entropy {metrics['entropy']:.3f} | Seed {seed}",
+                flush=True,
+            )
 
         if log_dir is not None:
             if is_main:

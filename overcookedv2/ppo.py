@@ -36,12 +36,15 @@ class PPOConfig:
     view_radius: Optional[int] = 3 # None gives the actor the full map.
     log_dir: str = "runs/gru"
     timeout_minutes: int = 10
-    print_every: int = 0  # Print kitchen 0 every N rollout steps; 0 disables it.
+    print_every: int = 100  # Print kitchen 0 every N rollout steps; 0 disables it.
     random_reset: bool = True  # Sample positions, inventories, and kitchen contents on reset.
 
 
-def print_kitchen(state, ego_index=0, actions=None, reward=None, done=None):
-    """Debug view of kitchen 0 only. Called only when printing is enabled."""
+def print_kitchen(
+    state, ego_index=0, actions=None, reward=None, done=None,
+    *, step=0, steps=None, episode_return=0.0,
+):
+    """Print one full-state kitchen snapshot, including the last joint action."""
     grid = state.grid[0].cpu().tolist()
     positions = state.agents.pos[0].cpu().tolist()
     directions = state.agents.direction[0].cpu().tolist()
@@ -55,31 +58,56 @@ def print_kitchen(state, ego_index=0, actions=None, reward=None, done=None):
         kind = "dish" if item & int(D.PLATE) else "ingredients"
         return f"{kind} {D.get_ingredients_list(item)}" + (" (cooked)" if item & int(D.COOKED) else "")
 
-    symbols = {S.EMPTY: ".", S.WALL: "W", S.POT: "P", S.PLATE_PILE: "B",
+    symbols = {S.EMPTY: ".", S.WALL: "#", S.POT: "P", S.PLATE_PILE: "B",
                S.GOAL: "X", S.RECIPE_INDICATOR: "R", S.BUTTON_RECIPE_INDICATOR: "L"}
     symbols.update({int(S.INGREDIENT_PILE_BASE) + i: str(i) for i in range(10)})
-    board = [[symbols.get(cell[0], "?") for cell in row] for row in grid]
+    board = [[symbols.get(cell[0], "?").center(3) for cell in row] for row in grid]
+    for row, cells in enumerate(grid):
+        for col, (static, item, _) in enumerate(cells):
+            if static == int(S.WALL):
+                board[row][col] = " * " if item else "###"
     for agent, (row, col) in enumerate(positions):
-        board[row][col] = "E" if agent == ego_index else "T"
+        label = "E" if agent == ego_index else "T"
+        board[row][col] = f"{label}{'^v<>'[directions[agent]]}".center(3)
 
-    lines = [f"\nKitchen 0 | state time={state.time[0].item()}"]
+    progress = f" | Rollout step {step}/{steps}" if steps is not None else ""
+    lines = [f"Kitchen 0{progress} | Episode time {state.time[0].item()}"]
+    names = ["-"] * len(positions)
     if actions is not None:
-        names = [Action(action).name for action in actions[0].cpu().tolist()]
-        lines.append(f"Actions just taken: ego={names[ego_index]}, teammate={names[1 - ego_index]}")
-        lines.append(f"Team reward={reward[0].item():g} | done={bool(done[0].item())}")
-        if done[0].item():
-            lines.append("Episode ended; the grid below has already been reset by env.step().")
-    lines.append("E=ego T=teammate W=counter/wall P=pot B=plates X=delivery R/L=recipe .=floor digits=ingredient piles")
-    lines.extend("".join(row) for row in board)
-    lines.append(f"True recipe (debug): {D.get_ingredients_list(state.recipe[0].item())}")
+        names = [Action(action).name.replace("MOVE_", "") for action in actions[0].cpu().tolist()]
+    if reward is not None:
+        lines.append(f"Last team reward: {reward[0].item():+g} | Kitchen return so far: {float(episode_return):g}")
+    if done is not None and done[0].item():
+        lines.append("EPISODE ENDED: the grid, recipe, and inventories below show the automatic reset.")
+        lines.append("The displayed last actions, reward, and return belong to the episode that ended.")
+
+    lines.extend(["", f"Recipe: {D.get_ingredients_list(state.recipe[0].item())} (full-state debug view)"])
+    width = len(grid[0])
+    border = "    +" + "---+" * width
+    lines.append("     " + " ".join(f"{col:^3}" for col in range(width)))
+    lines.append(border)
+    for row, cells in enumerate(board):
+        lines.append(f"{row:>3} |" + "|".join(cells) + "|")
+        lines.append(border)
+    lines.extend([
+        "E/T = ego/teammate; ^ v < > = facing; # = counter; * = counter with item",
+        "P = pot; B = plates; X = delivery; R/L = recipe; digits = ingredient piles",
+        "",
+        f"{'Agent':<10} {'Last action':<12} {'Position':<12} {'Facing':<8} Holding",
+    ])
     for agent, position in enumerate(positions):
         label = "Ego" if agent == ego_index else "Teammate"
-        lines.append(f"{label}: pos={position}, facing={Action(directions[agent]).name}, holding={item_name(inventory[agent])}")
+        facing = Action(directions[agent]).name.replace("MOVE_", "")
+        lines.append(f"{label:<10} {names[agent]:<12} {str(tuple(position)):<12} {facing:<8} {item_name(inventory[agent])}")
+    lines.extend(["", "Pots and items on counters (row, column):"])
     for row, cells in enumerate(grid):
         for col, (static, item, timer) in enumerate(cells):
             if item or timer or static == int(S.POT):
-                lines.append(f"Cell ({row},{col}) {symbols.get(static, '?')}: {item_name(item)}, timer={timer}")
-    print("\n".join(lines), flush=True)
+                lines.append(f"  ({row}, {col}) {symbols.get(static, '?')}: {item_name(item)}, timer={timer}")
+    panel_width = max(len(line) for line in lines)
+    panel_border = "+" + "-" * (panel_width + 2) + "+"
+    panel = [panel_border] + [f"| {line.ljust(panel_width)} |" for line in lines] + [panel_border]
+    print("\n" + "\n".join(panel), flush=True)
 
 
 def get_critic_obs(env, state, ego_index=0):
@@ -127,10 +155,11 @@ def collect_rollout(
 
     state = env.reset()
     if print_every:
-        print_kitchen(state, ego_index)
+        print_kitchen(state, ego_index, step=0, steps=steps)
     obs = env.get_obs(state)
     batch_size = state.grid.shape[0]
     device = state.grid.device
+    kitchen_return = torch.zeros((), device=device) if print_every else None
     previous_action = torch.zeros(batch_size, dtype=torch.long, device=device)
     previous_reward = torch.zeros(batch_size, device=device)
     episode_start = torch.ones(batch_size, dtype=torch.bool, device=device)
@@ -158,9 +187,14 @@ def collect_rollout(
         joint_actions[:, 1 - ego_index] = teammate(env, state, 1 - ego_index)
         next_state, next_obs, reward, _, done = env.step(state, joint_actions)
         # Shaped rewards are deliberately excluded from the training objective.
-        if print_every and ((step + 1) % print_every == 0 or step + 1 == steps):
-            print(f"\nRollout step {step + 1}/{steps}", flush=True)
-            print_kitchen(next_state, ego_index, joint_actions, reward, done)
+        if print_every:
+            kitchen_return += reward[0]
+            if (step + 1) % print_every == 0 or step + 1 == steps:
+                print_kitchen(
+                    next_state, ego_index, joint_actions, reward, done,
+                    step=step + 1, steps=steps, episode_return=kitchen_return.item(),
+                )
+            kitchen_return = kitchen_return.masked_fill(done[0], 0)
 
         transition = {
             "obs": ego_obs, "critic_obs": critic_obs,
