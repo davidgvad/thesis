@@ -99,6 +99,7 @@ def main():
     parser.add_argument("--batch-size", type=int, help="TOTAL kitchens across all devices.")
     parser.add_argument("--updates", type=int, help="Rollout/update cycles for the shared policy.")
     parser.add_argument("--minibatch-size", type=int, help="TOTAL kitchen sequences per optimizer step.")
+    parser.add_argument("--num-steps", type=int, help="Steps collected per kitchen before each PPO update.")
     parser.add_argument("--max-steps", type=int, help="Steps per episode.")
     parser.add_argument("--cpu-threads", type=int, help="PyTorch CPU threads per worker.")
     parser.add_argument("--role", choices=("runner", "deliverer", "flexible"), help="Fixed teammate role.")
@@ -126,7 +127,7 @@ def main():
     parser.set_defaults(**asdict(PPOConfig()))
     args = PPOConfig(**vars(parser.parse_args()))
 
-    for name in ("batch_size", "updates", "minibatch_size", "max_steps", "cpu_threads", "epochs", "timeout_minutes", "eval_batches"):
+    for name in ("batch_size", "updates", "minibatch_size", "num_steps", "max_steps", "cpu_threads", "epochs", "timeout_minutes", "eval_batches"):
         if getattr(args, name) < 1:
             parser.error(f"{name.replace('_', '-')} must be positive.")
     if args.view_radius is not None and args.view_radius < 0:

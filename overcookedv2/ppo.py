@@ -28,8 +28,9 @@ class PPOConfig:
     devices: list[str] = field(default_factory=lambda: ["cpu"])
     seed: int = 0
     batch_size: int = 256
-    updates: int = 293  # 30,003,200 steps with batch_size=256, max_steps=400.
-    max_steps: int = 400
+    updates: int = 457  # 29,949,952 steps with batch_size=256, num_steps=256.
+    num_steps: int = 256  # Steps per kitchen collected before each PPO update.
+    max_steps: int = 400  # Episode length, independent of rollout length.
     cpu_threads: int = 4
     role: str = "runner"
     teammate_type: str = "heuristic"  # "neural" trains a separate second actor.
@@ -140,41 +141,54 @@ def get_critic_obs(env, state, ego_index=0):
 @torch.no_grad()
 def collect_rollout(
     env, actor, critic, teammate=None, ego_index=0, steps=None, reset_actor_memory=False,
-    print_every=0, teammate_actor=None,
+    print_every=0, teammate_actor=None, carry=None,
 ):
-    """Collect ordered episodes. Defaults to the entire finite episode horizon.
+    """Collect ordered steps, possibly spanning episode boundaries.
 
     Supply either a fixed teammate(env, state, index), or teammate_actor using
     the same observation/history/memory interface as actor. The neural actors
     have separate memories and share one team-value prediction from critic.
-    Each collection starts fresh, with zero action/reward history and memory.
-    A shorter collection bootstraps its unfinished boundary; it is a truncated
-    training sequence. Use the default full horizon for the pilot.
+    Pass the previous rollout['carry'] to continue its state, history, and memory.
+    Without carry, start fresh; without steps, collect one full episode horizon.
+    Unfinished boundaries bootstrap from the critic rather than ending episodes.
     """
     if env.layout.agent_positions.shape[1] != 2 or ego_index not in (0, 1):
         raise ValueError("This collector requires two agents and ego_index 0 or 1.")
     if teammate_actor is None and teammate is None:
         raise ValueError("Provide a heuristic teammate or a teammate_actor.")
     steps = env.max_steps if steps is None else steps
-    if steps < 1 or steps > env.max_steps:
-        raise ValueError("steps must be between 1 and the episode horizon.")
+    if steps < 1:
+        raise ValueError("steps must be positive.")
     if print_every < 0:
         raise ValueError("print_every must be nonnegative.")
 
-    state = env.reset()
+    batch_size = env.layout.grid.shape[0]
+    device = env.layout.grid.device
+    if carry is None:
+        state = env.reset()
+        previous_action = torch.zeros(batch_size, dtype=torch.long, device=device)
+        previous_teammate_action = torch.zeros_like(previous_action)
+        previous_reward = torch.zeros(batch_size, device=device)
+        episode_start = torch.ones(batch_size, dtype=torch.bool, device=device)
+        actor_hidden = teammate_hidden = critic_hidden = None
+        episode_return = torch.zeros(batch_size, device=device)
+    else:
+        state = carry["state"]
+        previous_action = carry["previous_action"]
+        previous_teammate_action = carry["previous_teammate_action"]
+        previous_reward = carry["previous_reward"]
+        episode_start = carry["episode_start"]
+        actor_hidden = carry["actor_hidden"]
+        teammate_hidden = carry["teammate_hidden"]
+        critic_hidden = carry["critic_hidden"]
+        episode_return = carry["episode_return"]
+    obs = env.get_obs(state)
     if print_every:
         print_kitchen(state, ego_index, step=0, steps=steps)
-    obs = env.get_obs(state)
-    batch_size = state.grid.shape[0]
-    device = state.grid.device
-    kitchen_return = torch.zeros((), device=device) if print_every else None
-    previous_action = torch.zeros(batch_size, dtype=torch.long, device=device)
-    previous_reward = torch.zeros(batch_size, device=device)
-    episode_start = torch.ones(batch_size, dtype=torch.bool, device=device)
-    actor_hidden = None
-    teammate_hidden = None
-    previous_teammate_action = torch.zeros_like(previous_action)
-    critic_hidden = None
+    initial_actor_hidden = actor_hidden
+    initial_teammate_hidden = teammate_hidden
+    initial_critic_hidden = critic_hidden
+    completed_returns = []
     data = {key: [] for key in (
         "obs", "critic_obs", "previous_action", "previous_reward", "episode_start",
         "actions", "joint_actions", "log_prob", "values", "rewards", "done",
@@ -220,14 +234,16 @@ def collect_rollout(
                 teammate_data[key].append(value)
         next_state, next_obs, reward, _, done = env.step(state, joint_actions)
         # Shaped rewards are deliberately excluded from the training objective.
+        episode_return = episode_return + reward
+        # Keep a fixed [T, B] shape for gathering across GPUs. NaN means unfinished.
+        completed_returns.append(episode_return.masked_fill(~done, float("nan")))
         if print_every:
-            kitchen_return += reward[0]
             if (step + 1) % print_every == 0 or step + 1 == steps:
                 print_kitchen(
                     next_state, ego_index, joint_actions, reward, done,
-                    step=step + 1, steps=steps, episode_return=kitchen_return.item(),
+                    step=step + 1, steps=steps, episode_return=episode_return[0].item(),
                 )
-            kitchen_return = kitchen_return.masked_fill(done[0], 0)
+        episode_return = episode_return.masked_fill(done, 0)
 
         transition = {
             "obs": ego_obs, "critic_obs": critic_obs,
@@ -257,13 +273,25 @@ def collect_rollout(
     # A reset kitchen's value belongs to a different episode: never bootstrap it.
     rollout["next_value"] = next_value.masked_fill(episode_start, 0)
     rollout["reset_actor_memory"] = reset_actor_memory
+    rollout["initial_actor_hidden"] = initial_actor_hidden
+    rollout["initial_critic_hidden"] = initial_critic_hidden
+    rollout["episode_returns"] = torch.stack(completed_returns)
     if teammate_data is not None:
         # Copy the shared fields, then replace the actor-specific fields.
         teammate_rollout = rollout.copy()
         for key, values in teammate_data.items():
             teammate_rollout[key] = torch.stack(values) if values[0] is not None else None
         teammate_rollout["reset_actor_memory"] = False
+        teammate_rollout["initial_actor_hidden"] = initial_teammate_hidden
         rollout["teammate"] = teammate_rollout
+    # Saved outside the trajectory: PPO must not backpropagate into older rollouts.
+    rollout["carry"] = {
+        "state": state, "previous_action": previous_action,
+        "previous_teammate_action": previous_teammate_action,
+        "previous_reward": previous_reward, "episode_start": episode_start,
+        "actor_hidden": actor_hidden, "teammate_hidden": teammate_hidden,
+        "critic_hidden": critic_hidden, "episode_return": episode_return,
+    }
     return rollout
 
 
@@ -298,11 +326,13 @@ def normalize_advantages(advantages, distributed=False):
 
 def _update_actor(actor, optimizer, rollout, kitchens, advantages, config):
     """One PPO actor step; reusable for either actor's own trajectory."""
+    hidden = rollout.get("initial_actor_hidden")
+    hidden = hidden[kitchens] if hidden is not None else None
     logits, _ = actor(
         rollout["obs"][:, kitchens],
         rollout["previous_action"][:, kitchens],
         rollout["previous_reward"][:, kitchens],
-        None, rollout["episode_start"][:, kitchens],
+        hidden, rollout["episode_start"][:, kitchens],
         reset_memory=rollout["reset_actor_memory"],
     )
     distribution = Categorical(logits=logits)
@@ -361,7 +391,7 @@ def ppo_update(
         for start in range(0, batch_size, minibatch_size):
             kitchens = order[start:start + minibatch_size]
             # Leading dimensions remain [T, selected kitchens]. The GRU is
-            # recomputed with gradients through the entire sequence, from zero.
+            # recomputed with gradients from the saved memory at its start.
             actor_loss, entropy = _update_actor(
                 actor, actor_optimizer, rollout, kitchens, advantages, config,
             )
@@ -374,9 +404,11 @@ def ppo_update(
                 totals["teammate_actor_loss"] += teammate_loss * size
                 totals["teammate_entropy"] += teammate_entropy * size
 
+            hidden = rollout.get("initial_critic_hidden")
+            hidden = hidden[kitchens] if hidden is not None else None
             new_values, _ = critic(
                 rollout["critic_obs"][:, kitchens],
-                None, rollout["episode_start"][:, kitchens],
+                hidden, rollout["episode_start"][:, kitchens],
             )
             critic_loss = (new_values - targets[:, kitchens]).square().mean()
 

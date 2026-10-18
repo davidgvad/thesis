@@ -38,6 +38,8 @@ def train(
     seed = config.seed if seed is None else seed
     if updates < 1:
         raise ValueError("updates must be positive.")
+    if config.num_steps < 1:
+        raise ValueError("num_steps must be positive.")
     if config.eval_every < 0 or config.eval_batches < 1:
         raise ValueError("eval_every must be nonnegative and eval_batches must be positive.")
     rank = dist.get_rank() if distributed else 0
@@ -101,6 +103,7 @@ def train(
             dist.barrier()
 
     history = []
+    carry = None  # Continue unfinished episodes between rollout collections.
     for update in range(1, updates + 1):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -109,9 +112,11 @@ def train(
             print(f"\nRollout for update {update}", flush=True)
         rollout = collect_rollout(
             env, actor, critic, teammate,
+            steps=config.num_steps, carry=carry,
             print_every=config.print_every if is_main else 0,
             teammate_actor=teammate_actor,
         )
+        carry = rollout["carry"]
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         rollout_seconds = time.perf_counter() - start
@@ -124,12 +129,14 @@ def train(
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         ppo_seconds = time.perf_counter() - ppo_start
-        episode_returns = rollout["rewards"].sum(dim=0)
+        episode_returns = rollout["episode_returns"].flatten()
         if distributed:
-            # Gather each worker's [local B] returns to report the global batch.
+            # Gather fixed-size arrays, then remove unfinished-episode markers.
             returns_by_worker = [torch.empty_like(episode_returns) for _ in range(workers)]
             dist.all_gather(returns_by_worker, episode_returns)
             episode_returns = torch.cat(returns_by_worker)
+        episode_returns = episode_returns[~episode_returns.isnan()]
+        mean_return = episode_returns.mean().item() if episode_returns.numel() else None
         seconds = time.perf_counter() - start
         if distributed:
             # An update is only finished when its slowest worker is finished.
@@ -140,17 +147,18 @@ def train(
             seconds, rollout_seconds, ppo_seconds = worker_seconds.tolist()
         metrics.update({
             "update": update,
-            "env_steps": update * env.layout.grid.shape[0] * workers * env.max_steps,
-            "mean_return": episode_returns.mean().item(),
+            "env_steps": update * env.layout.grid.shape[0] * workers * config.num_steps,
+            "mean_return": mean_return,
             "episode_returns": episode_returns.cpu().tolist(),
             "seconds": seconds, "seed": seed,
             "rollout_seconds": rollout_seconds, "ppo_seconds": ppo_seconds,
         })
         history.append(metrics)
         if is_main:
+            return_text = f"{mean_return:.2f}" if mean_return is not None else "n/a (no completed episodes)"
             print(
                 f"\nUpdate {update}/{updates} | Steps {metrics['env_steps']:,} | "
-                f"Mean return {metrics['mean_return']:.2f} | {seconds:.2f}s\n"
+                f"Mean return {return_text} | {seconds:.2f}s\n"
                 f"  Actor loss {metrics['actor_loss']:.5f} | "
                 f"Critic loss {metrics['critic_loss']:.4f} | "
                 f"Entropy {metrics['entropy']:.3f} | Seed {seed}",

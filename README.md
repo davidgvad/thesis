@@ -86,8 +86,8 @@ forward(obs, previous_action, previous_reward, hidden, episode_start,
 
 It accepts a single timestep [B,...] and an ordered training sequence [T,B,...].
 The actor resets its own memory using episode_start. Memory is either None
-(for a feed-forward policy) or a tensor with a consistent shape for stacking
-the trace; it is not shared between actors. Other architectures need an adapter
+(for a feed-forward policy) or a tensor shaped [B,...], with the kitchen batch
+first; it is not shared between actors. Other architectures need an adapter
 if their interface differs. collect_rollout and evaluate also accept a
 teammate_actor for neural-pair rollouts without any weight updates.
 
@@ -151,8 +151,10 @@ For a quick environment check, two heuristic policies can control both agents:
     actions = torch.stack([runner(env, state, 0), deliverer(env, state, 1)], dim=-1)
     state, obs, reward, shaped_rewards, done = env.step(state, actions)
 
-For the pilot, use two agents, 16 parallel kitchens, and max_steps=400.
-Each update collects whole episodes and shuffles kitchen sequences while
+Rollout length and episode length are separate: `num_steps=256` controls how
+many steps each kitchen plays before PPO training; `max_steps=400` controls
+when an episode ends. Override these with `--num-steps` and `--max-steps`.
+Each update collects rollout sequences and shuffles kitchen sequences while
 keeping timesteps in order. The CNN encodes timesteps together; the GRU
 processes them in order with gradients through memory. Episode-start flags
 reset memory and zero previous action/reward features. The resulting done
@@ -162,13 +164,16 @@ at episode completion. Shaped rewards are excluded from the objective.
 PPO defaults: learning rate 0.00025, discount 0.99, GAE lambda 0.95, clipping
 0.2, entropy coefficient 0.01, value coefficient 0.5, maximum gradient norm
 0.25, and four update epochs. The debugging minibatch is four complete
-kitchen sequences. Measure throughput and memory before increasing it.
+kitchen rollout sequences. Measure throughput and memory before increasing it.
 
 For more direct control, use collect_rollout and ppo_update from ppo.py.
-Each collection starts from a fresh reset and zero ego/critic memory.
-collect_rollout supports steps < env.max_steps for debugging and bootstraps
-the unfinished boundary; this truncates training history. Use full episodes
-for the pilot.
+`collect_rollout(..., steps=256)` returns `rollout["carry"]`, containing the
+state, previous actions/reward, memories, and running episode returns. Pass it
+back as `carry=...` to continue the next collection. `train()` does this
+automatically. PPO starts each sequence from its saved initial memory; gradients
+stop at the rollout boundary. Unfinished boundaries bootstrap from the critic.
+Without `carry`, collection starts fresh. Without `steps`, it runs for
+`env.max_steps`, so evaluation still measures complete episodes.
 
 With log_dir set, train writes metrics.jsonl, config.json, and checkpoint.pt.
 Every evaluation check also saves the latest weights to checkpoint.pt, replacing
@@ -266,7 +271,8 @@ independent-seed launcher's meaning:
 | --- | --- | --- |
 | Kitchens per rollout (`--batch-size`) | 128 | 32 |
 | Kitchen sequences per optimizer step (`--minibatch-size`) | 16 | 4 |
-| Timesteps per kitchen (`--max-steps`) | 400 | 400 |
+| Rollout steps per kitchen (`--num-steps`) | 256 | 256 |
+| Episode limit (`--max-steps`) | 400 | 400 |
 
 Both batch sizes must be positive and divisible by the number of workers. Each
 worker runs the same number of PPO epochs and optimizer steps. A smaller final
@@ -278,7 +284,10 @@ not a separate normalization per GPU.
 The terminal prints compact update summaries: progress, environment steps,
 mean return, actor/critic losses, entropy, seed, and elapsed update time. The
 individual kitchen returns are saved in `metrics.jsonl`, without printing
-the long list to the terminal.
+the long list to the terminal. Training `mean_return` and `episode_returns`
+include only episodes completed during that collection, including rewards from
+earlier collections. If none finish, `mean_return` is JSON `null` and the
+console shows `n/a`; partial rollout rewards are not reported as full returns.
 
 By default, `PPOConfig.print_every = 100` shows kitchen 0 on worker 0 initially,
 every 100 rollout steps, and at the end of each rollout. Use `--print-every 10`
@@ -306,13 +315,13 @@ loads into the existing models without a DDP wrapper. If using `train(...,
 save_traces=True, distributed=True)` directly, each worker saves its local traces
 with a separate `_rank_0`, `_rank_1`, etc. suffix.
 
-The step count is `updates * batch_size * max_steps` across all GPUs. With a
-128-kitchen total batch and 400 steps, `--updates 586` collects approximately 30M
+The step count is `updates * batch_size * num_steps` across all GPUs. With a
+128-kitchen total batch and 256 rollout steps, `--updates 916` collects approximately 30M
 environment steps for the shared policy. Start with the shorter pilot to measure
 speed and memory first. Increasing the GPU count does not automatically improve
 throughput; the small networks and communication overhead need benchmarking.
 
-The default training budget is 293 updates: `293 * 256 * 400 = 30,003,200`
+The default training budget is 457 updates: `457 * 256 * 256 = 29,949,952`
 environment steps per run. This matches the approximate 30M-step scale used for
 several coordination tasks in the [OvercookedV2 paper, Appendix D.2](https://arxiv.org/html/2503.17821v1#A4.SS2).
 The paper also uses 4 PPO epochs, 10 independent training seeds, and 500
