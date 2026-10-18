@@ -28,10 +28,11 @@ class PPOConfig:
     devices: list[str] = field(default_factory=lambda: ["cpu"])
     seed: int = 0
     batch_size: int = 256
-    updates: int = 293  # updates: int = 293  # 30,003,200 steps with batch_size=256, max_steps=400
+    updates: int = 293  # 30,003,200 steps with batch_size=256, max_steps=400.
     max_steps: int = 400
     cpu_threads: int = 4
     role: str = "runner"
+    teammate_type: str = "heuristic"  # "neural" trains a separate second actor.
     layout: Optional[str] = None  # None selects the launcher's example kitchen.
     view_radius: Optional[int] = 3 # None gives the actor the full map.
     log_dir: str = "runs/gru"
@@ -138,18 +139,22 @@ def get_critic_obs(env, state, ego_index=0):
 
 @torch.no_grad()
 def collect_rollout(
-    env, actor, critic, teammate, ego_index=0, steps=None, reset_actor_memory=False,
-    print_every=0,
+    env, actor, critic, teammate=None, ego_index=0, steps=None, reset_actor_memory=False,
+    print_every=0, teammate_actor=None,
 ):
     """Collect ordered episodes. Defaults to the entire finite episode horizon.
 
-    teammate(env, state, teammate_index) returns fixed actions shaped [B].
+    Supply either a fixed teammate(env, state, index), or teammate_actor using
+    the same observation/history/memory interface as actor. The neural actors
+    have separate memories and share one team-value prediction from critic.
     Each collection starts fresh, with zero action/reward history and memory.
     A shorter collection bootstraps its unfinished boundary; it is a truncated
     training sequence. Use the default full horizon for the pilot.
     """
     if env.layout.agent_positions.shape[1] != 2 or ego_index not in (0, 1):
-        raise ValueError("This pilot uses two agents: one ego and one fixed teammate.")
+        raise ValueError("This collector requires two agents and ego_index 0 or 1.")
+    if teammate_actor is None and teammate is None:
+        raise ValueError("Provide a heuristic teammate or a teammate_actor.")
     steps = env.max_steps if steps is None else steps
     if steps < 1 or steps > env.max_steps:
         raise ValueError("steps must be between 1 and the episode horizon.")
@@ -167,12 +172,19 @@ def collect_rollout(
     previous_reward = torch.zeros(batch_size, device=device)
     episode_start = torch.ones(batch_size, dtype=torch.bool, device=device)
     actor_hidden = None
+    teammate_hidden = None
+    previous_teammate_action = torch.zeros_like(previous_action)
     critic_hidden = None
     data = {key: [] for key in (
         "obs", "critic_obs", "previous_action", "previous_reward", "episode_start",
         "actions", "joint_actions", "log_prob", "values", "rewards", "done",
         "actor_hidden", "action_probs",
     )}
+    # Only the second actor's own inputs/outputs differ. Rewards, boundaries,
+    # and centralized values are shared by both actors.
+    teammate_data = {key: [] for key in (
+        "obs", "previous_action", "actions", "log_prob", "actor_hidden", "action_probs",
+    )} if teammate_actor is not None else None
 
     for step in range(steps):
         ego_obs = obs[:, ego_index]
@@ -187,7 +199,25 @@ def collect_rollout(
 
         joint_actions = torch.empty((batch_size, 2), dtype=torch.long, device=device)
         joint_actions[:, ego_index] = action
-        joint_actions[:, 1 - ego_index] = teammate(env, state, 1 - ego_index)
+        if teammate_actor is None:
+            joint_actions[:, 1 - ego_index] = teammate(env, state, 1 - ego_index)
+        else:
+            teammate_obs = obs[:, 1 - ego_index]
+            teammate_logits, teammate_hidden = teammate_actor(
+                teammate_obs, previous_teammate_action, previous_reward,
+                teammate_hidden, episode_start,
+            )
+            teammate_distribution = Categorical(logits=teammate_logits)
+            teammate_action = teammate_distribution.sample()
+            joint_actions[:, 1 - ego_index] = teammate_action
+            teammate_transition = {
+                "obs": teammate_obs, "previous_action": previous_teammate_action,
+                "actions": teammate_action,
+                "log_prob": teammate_distribution.log_prob(teammate_action),
+                "actor_hidden": teammate_hidden, "action_probs": teammate_distribution.probs,
+            }
+            for key, value in teammate_transition.items():
+                teammate_data[key].append(value)
         next_state, next_obs, reward, _, done = env.step(state, joint_actions)
         # Shaped rewards are deliberately excluded from the training objective.
         if print_every:
@@ -213,17 +243,27 @@ def collect_rollout(
         state, obs = next_state, next_obs
         episode_start = done
         previous_action = action.masked_fill(done, 0)
+        previous_teammate_action = joint_actions[:, 1 - ego_index].masked_fill(done, 0)
         previous_reward = reward.masked_fill(done, 0)
-        actor_hidden = actor_hidden.masked_fill(done[:, None], 0)
-        critic_hidden = critic_hidden.masked_fill(done[:, None], 0)
+        # Each network resets its own memory using episode_start on the next call.
 
     next_value, _ = critic(
         get_critic_obs(env, state, ego_index), critic_hidden, episode_start
     )
-    rollout = {key: torch.stack(values) for key, values in data.items()}
+    rollout = {
+        key: torch.stack(values) if values[0] is not None else None
+        for key, values in data.items()
+    }
     # A reset kitchen's value belongs to a different episode: never bootstrap it.
     rollout["next_value"] = next_value.masked_fill(episode_start, 0)
     rollout["reset_actor_memory"] = reset_actor_memory
+    if teammate_data is not None:
+        # Copy the shared fields, then replace the actor-specific fields.
+        teammate_rollout = rollout.copy()
+        for key, values in teammate_data.items():
+            teammate_rollout[key] = torch.stack(values) if values[0] is not None else None
+        teammate_rollout["reset_actor_memory"] = False
+        rollout["teammate"] = teammate_rollout
     return rollout
 
 
@@ -256,18 +296,50 @@ def normalize_advantages(advantages, distributed=False):
     return (advantages - mean) / (std + 1e-8)
 
 
+def _update_actor(actor, optimizer, rollout, kitchens, advantages, config):
+    """One PPO actor step; reusable for either actor's own trajectory."""
+    logits, _ = actor(
+        rollout["obs"][:, kitchens],
+        rollout["previous_action"][:, kitchens],
+        rollout["previous_reward"][:, kitchens],
+        None, rollout["episode_start"][:, kitchens],
+        reset_memory=rollout["reset_actor_memory"],
+    )
+    distribution = Categorical(logits=logits)
+    new_log_prob = distribution.log_prob(rollout["actions"][:, kitchens])
+    ratio = (new_log_prob - rollout["log_prob"][:, kitchens]).exp()
+    selected_advantages = advantages[:, kitchens]
+    ordinary = ratio * selected_advantages
+    clipped = ratio.clamp(1 - config.clip, 1 + config.clip) * selected_advantages
+    actor_loss = -torch.minimum(ordinary, clipped).mean()
+    entropy = distribution.entropy().mean()
+
+    optimizer.zero_grad(set_to_none=True)
+    # DDP synchronizes this actor's gradients before clipping and stepping.
+    (actor_loss - config.entropy_coef * entropy).backward()
+    clip_grad_norm_(actor.parameters(), config.max_grad_norm)
+    optimizer.step()
+    return actor_loss.item(), entropy.item()
+
+
 def ppo_update(
     actor, critic, actor_optimizer, critic_optimizer, rollout, config,
-    distributed=False,
+    distributed=False, teammate_actor=None, teammate_optimizer=None,
 ):
     """Keep sequences ordered; DDP averages gradients during backward().
 
     In distributed mode, every worker must have the same rollout shape/config.
-    actor and critic must be DistributedDataParallel wrappers in that mode.
+    Train a second actor when its model and optimizer are supplied. Both actors
+    use the same team advantages; the critic is updated only once per minibatch.
+    All networks being updated must be DDP wrappers in distributed mode.
     """
     minibatch_size = config.minibatch_size
     if minibatch_size < 1 or config.epochs < 1:
         raise ValueError("minibatch_size and epochs must be positive.")
+    if (teammate_actor is None) != (teammate_optimizer is None):
+        raise ValueError("Provide both teammate_actor and teammate_optimizer to train it.")
+    if teammate_actor is not None and "teammate" not in rollout:
+        raise ValueError("The rollout must contain the neural teammate's experience.")
     if distributed:
         if minibatch_size % dist.get_world_size() != 0:
             raise ValueError("minibatch_size must divide evenly across workers.")
@@ -280,6 +352,8 @@ def ppo_update(
     advantages = normalize_advantages(advantages, distributed)
     batch_size = advantages.shape[1]
     totals = {"actor_loss": 0.0, "critic_loss": 0.0, "entropy": 0.0}
+    if teammate_actor is not None:
+        totals.update({"teammate_actor_loss": 0.0, "teammate_entropy": 0.0})
     count = 0
 
     for _ in range(config.epochs):
@@ -288,52 +362,42 @@ def ppo_update(
             kitchens = order[start:start + minibatch_size]
             # Leading dimensions remain [T, selected kitchens]. The GRU is
             # recomputed with gradients through the entire sequence, from zero.
-            logits, _ = actor(
-                rollout["obs"][:, kitchens],
-                rollout["previous_action"][:, kitchens],
-                rollout["previous_reward"][:, kitchens],
-                None, rollout["episode_start"][:, kitchens],
-                reset_memory=rollout["reset_actor_memory"],
+            actor_loss, entropy = _update_actor(
+                actor, actor_optimizer, rollout, kitchens, advantages, config,
             )
+            size = kitchens.numel()
+            if teammate_actor is not None:
+                teammate_loss, teammate_entropy = _update_actor(
+                    teammate_actor, teammate_optimizer, rollout["teammate"],
+                    kitchens, advantages, config,
+                )
+                totals["teammate_actor_loss"] += teammate_loss * size
+                totals["teammate_entropy"] += teammate_entropy * size
+
             new_values, _ = critic(
                 rollout["critic_obs"][:, kitchens],
                 None, rollout["episode_start"][:, kitchens],
             )
-            distribution = Categorical(logits=logits)
-            new_log_prob = distribution.log_prob(rollout["actions"][:, kitchens])
-            ratio = (new_log_prob - rollout["log_prob"][:, kitchens]).exp()
-            selected_advantages = advantages[:, kitchens]
-            ordinary = ratio * selected_advantages
-            clipped = ratio.clamp(1 - config.clip, 1 + config.clip) * selected_advantages
-            actor_loss = -torch.minimum(ordinary, clipped).mean()
-            entropy = distribution.entropy().mean()
             critic_loss = (new_values - targets[:, kitchens]).square().mean()
-
-            actor_optimizer.zero_grad(set_to_none=True)
-            # With DDP, backward() averages gradients across workers BEFORE
-            # clipping and stepping. Every replica therefore gets the same update.
-            (actor_loss - config.entropy_coef * entropy).backward()
-            clip_grad_norm_(actor.parameters(), config.max_grad_norm)
-            actor_optimizer.step()
 
             critic_optimizer.zero_grad(set_to_none=True)
             (config.value_coef * critic_loss).backward()
             clip_grad_norm_(critic.parameters(), config.max_grad_norm)
             critic_optimizer.step()
 
-            size = kitchens.numel()
-            totals["actor_loss"] += actor_loss.item() * size
+            totals["actor_loss"] += actor_loss * size
             totals["critic_loss"] += critic_loss.item() * size
-            totals["entropy"] += entropy.item() * size
+            totals["entropy"] += entropy * size
             count += size
 
     if distributed:
         # Report losses over all workers, weighted by their kitchen counts.
         combined = torch.tensor(
-            [totals["actor_loss"], totals["critic_loss"], totals["entropy"], count],
+            list(totals.values()) + [count],
             device=advantages.device, dtype=torch.float64,
         )
         dist.all_reduce(combined, op=dist.ReduceOp.SUM)
-        actor_total, critic_total, entropy_total, count = combined.tolist()
-        totals = {"actor_loss": actor_total, "critic_loss": critic_total, "entropy": entropy_total}
+        numbers = combined.tolist()
+        totals = dict(zip(totals, numbers[:-1]))
+        count = numbers[-1]
     return {key: value / count for key, value in totals.items()}

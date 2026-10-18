@@ -1,4 +1,4 @@
-"""Train ONE GRU actor/critic across selected GPUs (or CPU workers)."""
+"""Train an ego with a heuristic, or two separate actors sharing one critic."""
 
 import argparse
 from dataclasses import asdict
@@ -39,7 +39,7 @@ EXAMPLE_LAYOUT = {
 
 def run_worker(worker_index, args, init_method=None):
     # A worker handles one device and its share of kitchens. All workers train
-    # the same policy, worker_index is its communication ID (called its rank).
+    # the same networks; worker_index is its communication ID (called its rank).
     workers = len(args.devices)
     distributed = workers > 1
     device = torch.device(args.devices[worker_index])
@@ -70,7 +70,7 @@ def run_worker(worker_index, args, init_method=None):
             layout, max_steps=args.max_steps, agent_view_size=args.view_radius,
             random_reset=args.random_reset,
         )
-        teammate = AssemblyLineTeammate(role=args.role)
+        teammate = AssemblyLineTeammate(role=args.role) if args.teammate_type == "heuristic" else None
 
         print(f"worker={worker_index} device={device} kitchens={kitchens_per_worker}", flush=True)
         train(
@@ -79,7 +79,8 @@ def run_worker(worker_index, args, init_method=None):
             metadata={
                 "devices": args.devices, "cpu_threads_per_worker": args.cpu_threads,
                 "layout": layout_spec, "view_radius": args.view_radius,
-                "teammate_role": args.role,
+                "teammate_role": args.role if args.teammate_type == "heuristic" else None,
+                "teammate_type": args.teammate_type,
                 "sampling_seeds": [args.seed + rank for rank in range(workers)],
             },
         )
@@ -101,6 +102,8 @@ def main():
     parser.add_argument("--max-steps", type=int, help="Steps per episode.")
     parser.add_argument("--cpu-threads", type=int, help="PyTorch CPU threads per worker.")
     parser.add_argument("--role", choices=("runner", "deliverer", "flexible"), help="Fixed teammate role.")
+    parser.add_argument("--teammate-type", choices=("heuristic", "neural"),
+                        help="Use a fixed heuristic or train a separate neural teammate with the shared critic.")
     parser.add_argument("--layout", help="JSON file containing grid and recipes; None uses the example.")
     parser.add_argument("--view-radius", type=int, help="Actor view radius; None gives the full map.")
     parser.add_argument("--log-dir", help="Directory for this run's logs and checkpoint.")
@@ -179,7 +182,7 @@ def main():
     if run_dir.exists():
         parser.error(f"{run_dir} already exists; choose a new --log-dir or --seed.")
     run_dir.mkdir(parents=True, exist_ok=False)
-    print(f"One shared policy, seed={args.seed}, output={run_dir}", flush=True)
+    print(f"Teammate={args.teammate_type}, seed={args.seed}, output={run_dir}", flush=True)
 
     if workers == 1:
         run_worker(0, args)

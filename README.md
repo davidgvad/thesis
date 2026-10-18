@@ -1,7 +1,8 @@
 # Overcooked V2: GRU actor and PPO
 
 A batched PyTorch environment and a small recurrent PPO implementation.
-You can supply a teammate policy or use the configurable Assembly Line heuristic.
+You can use the configurable Assembly Line heuristic or train two separate
+neural actors sharing one centralized critic.
 
 - overcookedv2/models.py: the CNN encoder, GRU actor, and separate GRU critic.
 - overcookedv2/ppo.py: critic inputs, rollout collection, GAE, and PPO updates.
@@ -41,12 +42,66 @@ From Python running in the overcookedv2 folder, use your existing environment:
     )
     returns = evaluate(env, actor, critic, teammate_policy, episodes=1)
 
-The policy interface is teammate_policy(env, state, agent_index). It returns
-integer actions shaped [B], on the environment's device. A neural teammate
-can be supplied through this interface. This implementation updates only the
-ego actor and centralized critic; jointly training a teammate would need its
-own update step later. A recurrent teammate should reset its own memory for
-kitchens where state.time == 0.
+The heuristic interface is teammate_policy(env, state, agent_index), returning
+integer actions shaped [B] on the environment's device. Neural teammates use
+the actor interface described below, so their observations, previous actions,
+and memories stay separate from the ego's.
+
+## Two learning neural actors
+
+Use `--teammate-type neural` to train a second GRU actor with its own weights
+and Adam optimizer. Both actors use the same team advantages from one shared
+centralized critic. Every minibatch updates actor 0, actor 1, then the critic
+once. This is a MAPPO-style setup with separate actor parameters.
+
+```bash
+NCCL_P2P_DISABLE=1 python3 -u overcookedv2/run_gru.py \
+    --devices cuda:0 cuda:1 cuda:2 cuda:3 --teammate-type neural \
+    --log-dir runs/two_learning_actors
+```
+
+`--teammate-type heuristic` keeps the original fixed-teammate mode and is the
+default. `--role` selects the heuristic role only. No network definitions or
+environment rules change between these modes.
+
+For another compatible neural architecture, pass your own instances from Python:
+
+```python
+ego = GRUActor(env.obs_shape)        # Replace with your compatible actor class.
+partner = GRUActor(env.obs_shape)    # A separate instance with separate weights.
+actor, critic, history = train(
+    env, actor=ego, teammate_actor=partner,
+    config=PPOConfig(), log_dir="runs/custom_pair",
+)
+```
+
+Passing `teammate_actor` selects neural mode. The supplied models are updated
+in place, so `partner` remains available afterward. The return tuple is unchanged.
+A compatible actor follows:
+
+```text
+forward(obs, previous_action, previous_reward, hidden, episode_start,
+        reset_memory=False) -> (six action logits, next_hidden)
+```
+
+It accepts a single timestep [B,...] and an ordered training sequence [T,B,...].
+The actor resets its own memory using episode_start. Memory is either None
+(for a feed-forward policy) or a tensor with a consistent shape for stacking
+the trace; it is not shared between actors. Other architectures need an adapter
+if their interface differs. collect_rollout and evaluate also accept a
+teammate_actor for neural-pair rollouts without any weight updates.
+
+Neural-mode checkpoints add `teammate_actor` alongside `actor` and `critic`.
+Metrics add `teammate_actor_loss` and `teammate_entropy`. The existing periodic
+checks still evaluate the ego (actor 0) against the three heuristic roles;
+they do not update either neural actor.
+
+For a timing comparison, run each mode with the same settings and add
+`--updates 12 --print-every 0 --eval-every 0`. Compare `rollout_seconds`,
+`ppo_seconds`, and total `seconds` in metrics.jsonl after the first two updates.
+CUDA work is synchronized at timing boundaries; distributed times report the
+slowest worker in each phase. Training two neural actors adds both partner
+inference and a second actor update, so this measures joint-training cost.
 
 The heuristic adapts the existing
 [ICRL4AHT Assembly Line family](https://github.com/AHT-Hub/ICRL4AHT/blob/main/agents/overcooked_v2/assembly_line_agent.py),
@@ -153,8 +208,8 @@ in PPOConfig and can be overridden with:
 --eval-seed 10000  # fixed evaluation seeds, plus worker rank
 ```
 
-With the default 128 kitchens, one check evaluates 128 episodes per role,
-384 episodes total. Use --eval-batches 4 for 512 episodes per role. Every
+With the default 256 kitchens, one check evaluates 256 episodes per role,
+768 episodes total. Use --eval-batches 2 for 512 episodes per role. Every
 checkpoint uses the same evaluation seeds to make progress easier to compare.
 Evaluation interactions are additional work and are not included in env_steps,
 which counts only training interactions.
@@ -189,8 +244,10 @@ how many collect-rollout/train cycles to run. The resolved settings are saved
 with the run, so CLI overrides are recorded too.
 
 `overcookedv2/run_gru.py` distributes ONE training run over devices on one server.
-Each GPU has its own kitchens and a copy of the actor and critic. Those network
-copies start with identical weights. PyTorch DistributedDataParallel (DDP)
+Each GPU has its own kitchens and copies of the training networks (two actors
+and one critic in neural mode). Each network's copies start with identical
+weights across workers; actor 0 and actor 1 remain distinct networks.
+PyTorch DistributedDataParallel (DDP)
 averages their gradients during each `backward()` call. Every copy then applies
 that same update, so the weights stay synchronized.
 
@@ -255,7 +312,7 @@ environment steps for the shared policy. Start with the shorter pilot to measure
 speed and memory first. Increasing the GPU count does not automatically improve
 throughput; the small networks and communication overhead need benchmarking.
 
-The default training budget is now 586 updates: `586 * 128 * 400 = 30,003,200`
+The default training budget is 293 updates: `293 * 256 * 400 = 30,003,200`
 environment steps per run. This matches the approximate 30M-step scale used for
 several coordination tasks in the [OvercookedV2 paper, Appendix D.2](https://arxiv.org/html/2503.17821v1#A4.SS2).
 The paper also uses 4 PPO epochs, 10 independent training seeds, and 500
@@ -309,8 +366,8 @@ the sampling sequence, and the chosen setting is saved in the configuration.
 `--view-radius 2` gives the actor a local view; omitting it gives the full map.
 The critic still receives its centralized input. Device choices, layout, role,
 view radius, CPU threads, and sampling seeds are saved in the run configuration.
-This launcher still uses one fixed teammate configuration; response-based
-teammate populations remain a separate part of the experiment.
+The launcher uses one heuristic configuration or one learning neural partner;
+response-based teammate populations remain a separate part of the experiment.
 
 A small CPU test of the shared-policy launcher:
 
