@@ -42,6 +42,8 @@ def train(
         raise ValueError("num_steps must be positive.")
     if config.eval_every < 0 or config.eval_batches < 1:
         raise ValueError("eval_every must be nonnegative and eval_batches must be positive.")
+    if config.reward_shaping_horizon < 0:
+        raise ValueError("reward_shaping_horizon must be nonnegative.")
     rank = dist.get_rank() if distributed else 0
     workers = dist.get_world_size() if distributed else 1
     is_main = rank == 0
@@ -104,17 +106,23 @@ def train(
 
     history = []
     carry = None  # Continue unfinished episodes between rollout collections.
+    steps_per_update = env.layout.grid.shape[0] * workers * config.num_steps
     for update in range(1, updates + 1):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         start = time.perf_counter()
         if is_main and config.print_every:
             print(f"\nRollout for update {update}", flush=True)
+        # Use the total steps across all GPUs, so every worker uses the same bonus.
+        shaping_coef = 0.0
+        if config.reward_shaping_horizon > 0:
+            steps_so_far = (update - 1) * steps_per_update
+            shaping_coef = max(0.0, 1.0 - steps_so_far / config.reward_shaping_horizon)
         rollout = collect_rollout(
             env, actor, critic, teammate,
             steps=config.num_steps, carry=carry,
             print_every=config.print_every if is_main else 0,
-            teammate_actor=teammate_actor,
+            teammate_actor=teammate_actor, shaping_coef=shaping_coef,
         )
         carry = rollout["carry"]
         if device.type == "cuda":
@@ -147,7 +155,8 @@ def train(
             seconds, rollout_seconds, ppo_seconds = worker_seconds.tolist()
         metrics.update({
             "update": update,
-            "env_steps": update * env.layout.grid.shape[0] * workers * config.num_steps,
+            "env_steps": update * steps_per_update,
+            "shaping_coef": shaping_coef,
             "mean_return": mean_return,
             "episode_returns": episode_returns.cpu().tolist(),
             "seconds": seconds, "seed": seed,
@@ -169,7 +178,7 @@ def train(
                     f"  Teammate actor loss {metrics['teammate_actor_loss']:.5f} | "
                     f"Teammate entropy {metrics['teammate_entropy']:.3f}", flush=True,
                 )
-            print(f"  Rollout {rollout_seconds:.2f}s | PPO {ppo_seconds:.2f}s", flush=True)
+            print(f"  Rollout {rollout_seconds:.2f}s | PPO {ppo_seconds:.2f}s | Shaping {shaping_coef:.3f}", flush=True)
 
         if log_dir is not None:
             if is_main:
@@ -177,7 +186,7 @@ def train(
                     file.write(json.dumps(metrics) + "\n")
             if save_traces:
                 trace_keys = (
-                    "joint_actions", "rewards", "done", "episode_start",
+                    "joint_actions", "rewards", "training_rewards", "done", "episode_start",
                     "actor_hidden", "values", "action_probs",
                 )
                 trace_name = f"trace_{update}_rank_{rank}.pt" if distributed else f"trace_{update}.pt"

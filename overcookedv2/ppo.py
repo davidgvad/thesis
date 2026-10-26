@@ -23,6 +23,7 @@ class PPOConfig:
     max_grad_norm: float = 0.25
     epochs: int = 4
     minibatch_size: int = 4  # Total kitchen sequences per step, across all workers.
+    reward_shaping_horizon: int = 5_000_000  # Fade preparation bonuses to zero; 0 disables them.
 
     # Run settings. Batch sizes are totals across all workers.
     devices: list[str] = field(default_factory=lambda: ["cpu"])
@@ -39,7 +40,8 @@ class PPOConfig:
     log_dir: str = "runs/gru"
     timeout_minutes: int = 10
     print_every: int = 100  # Print kitchen 0 every N rollout steps; 0 disables it.
-    random_reset: bool = True  # Sample positions, inventories, and kitchen contents on reset.
+    random_reset: bool = False  # True also randomizes inventories and kitchen contents.
+    random_agent_positions: bool = True  # Random positions/directions, within each agent's room.
     eval_every: int = 20  # Evaluate all three teammate roles; 0 disables evaluation.
     eval_batches: int = 1  # Full batches per role: 1 means batch_size episodes in total.
     eval_seed: int = 10000  # Reuse evaluation seeds at every check.
@@ -141,7 +143,7 @@ def get_critic_obs(env, state, ego_index=0):
 @torch.no_grad()
 def collect_rollout(
     env, actor, critic, teammate=None, ego_index=0, steps=None, reset_actor_memory=False,
-    print_every=0, teammate_actor=None, carry=None,
+    print_every=0, teammate_actor=None, carry=None, shaping_coef=0.0,
 ):
     """Collect ordered steps, possibly spanning episode boundaries.
 
@@ -151,6 +153,7 @@ def collect_rollout(
     Pass the previous rollout['carry'] to continue its state, history, and memory.
     Without carry, start fresh; without steps, collect one full episode horizon.
     Unfinished boundaries bootstrap from the critic rather than ending episodes.
+    Preparation bonuses affect training_rewards only; scores and reward inputs stay raw.
     """
     if env.layout.agent_positions.shape[1] != 2 or ego_index not in (0, 1):
         raise ValueError("This collector requires two agents and ego_index 0 or 1.")
@@ -191,7 +194,7 @@ def collect_rollout(
     completed_returns = []
     data = {key: [] for key in (
         "obs", "critic_obs", "previous_action", "previous_reward", "episode_start",
-        "actions", "joint_actions", "log_prob", "values", "rewards", "done",
+        "actions", "joint_actions", "log_prob", "values", "rewards", "training_rewards", "done",
         "actor_hidden", "action_probs",
     )}
     # Only the second actor's own inputs/outputs differ. Rewards, boundaries,
@@ -232,8 +235,9 @@ def collect_rollout(
             }
             for key, value in teammate_transition.items():
                 teammate_data[key].append(value)
-        next_state, next_obs, reward, _, done = env.step(state, joint_actions)
-        # Shaped rewards are deliberately excluded from the training objective.
+        next_state, next_obs, reward, shaped_rewards, done = env.step(state, joint_actions)
+        # One team critic means both actors use the same combined reward.
+        training_reward = reward + shaping_coef * shaped_rewards.sum(dim=-1)
         episode_return = episode_return + reward
         # Keep a fixed [T, B] shape for gathering across GPUs. NaN means unfinished.
         completed_returns.append(episode_return.masked_fill(~done, float("nan")))
@@ -250,7 +254,7 @@ def collect_rollout(
             "previous_action": previous_action, "previous_reward": previous_reward,
             "episode_start": episode_start, "actions": action,
             "joint_actions": joint_actions, "log_prob": distribution.log_prob(action),
-            "values": values, "rewards": reward, "done": done,
+            "values": values, "rewards": reward, "training_rewards": training_reward, "done": done,
             "actor_hidden": actor_hidden, "action_probs": distribution.probs,
         }
         for key, value in transition.items():
@@ -376,7 +380,8 @@ def ppo_update(
         # Each worker handles only its share of the total minibatch.
         minibatch_size //= dist.get_world_size()
     advantages, targets = compute_gae(
-        rollout["rewards"], rollout["values"], rollout["done"], rollout["next_value"],
+        rollout.get("training_rewards", rollout["rewards"]),
+        rollout["values"], rollout["done"], rollout["next_value"],
         config.gamma, config.gae_lambda,
     )
     advantages = normalize_advantages(advantages, distributed)

@@ -159,7 +159,18 @@ keeping timesteps in order. The CNN encodes timesteps together; the GRU
 processes them in order with gradients through memory. Episode-start flags
 reset memory and zero previous action/reward features. The resulting done
 flags describe transitions and are stored separately. Value bootstrap is zero
-at episode completion. Shaped rewards are excluded from the objective.
+at episode completion.
+
+PPO trains on `delivery_reward + shaping_coef * shaped_rewards.sum(dim=-1)`.
+The existing preparation bonuses reward useful ingredient placement, starting
+the correct pot, and useful plate/dish pickups. We sum both agents' bonuses
+because the actors share one team critic. The coefficient starts at 1 and fades
+linearly to 0 over `reward_shaping_horizon=5_000_000` training environment steps,
+counted across all GPUs. Use `--reward-shaping-horizon 0` to disable bonuses.
+The coefficient is printed and saved as `shaping_coef` in metrics.jsonl.
+`rollout["training_rewards"]` feeds GAE and both actors' PPO advantages;
+`rollout["rewards"]`, actor previous-reward inputs, reported episode returns,
+and evaluation scores remain delivery rewards only.
 
 PPO defaults: learning rate 0.00025, discount 0.99, GAE lambda 0.95, clipping
 0.2, entropy coefficient 0.01, value coefficient 0.5, maximum gradient norm
@@ -199,8 +210,8 @@ By default, training evaluates the frozen policy every 20 updates and at the
 final update against each heuristic role: runner, deliverer, and flexible.
 Evaluation uses empty pots/counters/inventories, random positions/directions
 within each agent's room, the same recipes and other rules, and sampled actor
-actions. Its returns can differ from training returns, which use random kitchen
-contents by default. Evaluation does not update weights or consume the training
+actions. Training now uses the same empty-kitchen reset mode by default.
+Evaluation does not update weights or consume the training
 random-number sequence; the model's training/evaluation mode is restored afterward.
 
 All workers participate using the original models (no DDP backward calls).
@@ -354,25 +365,26 @@ in one shared training run is intentionally unsupported here. If a worker fails,
 the launcher reports the error and stops the others. Use a new output directory
 or seed for another attempt; existing seed folders are refused to protect logs.
 
-The default kitchen is a small example, not the selected thesis task. Supply your
-actual kitchen with `--layout path/to/kitchen.json`. The JSON structure is:
+The default kitchen is the paper's `cramped_room_v2`, with two ingredients,
+a recipe indicator, and four recipes: 000, 001, 011, and 111. Supply another
+kitchen with `--layout path/to/kitchen.json`. The JSON structure is:
 
 ```json
 {"grid": "WWWWWWW\nW0 P BW\nWA R AW\nW  X  W\nWWWWWWW", "recipes": [[0, 0, 0]]}
 ```
 
-Training uses `PPOConfig.random_reset = True` by default. Each rollout starts
-with freshly sampled agent positions/directions, inventories, and pot/counter
-contents, using the environment's existing random reset. The map stays fixed,
-and agents stay in their original rooms. Automatic resets at episode end use
-the same mode. Use `--no-random-reset` for the original empty starting state,
-or `--random-reset` to explicitly enable randomization. The run seed controls
-the sampling sequence, and the chosen setting is saved in the configuration.
+Training defaults to `random_reset=False` and `random_agent_positions=True`.
+At episode start, hands, pots, and counters are empty; positions and directions
+are sampled within each agent's original room. The map stays fixed, and recipes
+are sampled on reset and after correct deliveries. Unfinished episodes continue
+between rollout collections. Use `--random-reset` to also randomize inventories
+and pot/counter contents, or `--no-random-agent-positions` for fixed starting
+positions when full random reset is off. The chosen settings are saved with the run.
 
 `grid` uses the symbols from `Layout.from_string` and must contain two agents.
 `recipes` lists possible three-ingredient recipes. Use `--role runner`,
-`--role deliverer`, or `--role flexible` (default) to choose the fixed teammate.
-`--view-radius 2` gives the actor a local view; omitting it gives the full map.
+`--role deliverer`, or `--role flexible` to choose the fixed teammate (default: runner).
+The actor's default view radius is 3; use `--view-radius 2` to change it.
 The critic still receives its centralized input. Device choices, layout, role,
 view radius, CPU threads, and sampling seeds are saved in the run configuration.
 The launcher uses one heuristic configuration or one learning neural partner;

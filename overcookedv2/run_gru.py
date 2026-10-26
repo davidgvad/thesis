@@ -18,15 +18,14 @@ from train_gru import train
 from v2 import OvercookedEnv
 
 
-# A small example kitchen for checking the launcher, not the thesis benchmark.
-# Use --layout to supply your actual kitchen and possible recipes as JSON.
+# Cramped Room V2 from the paper: two ingredients and a visible recipe indicator.
+# Use --layout to supply another kitchen and possible recipes as JSON.
 EXAMPLE_LAYOUT = {
     "grid": (
-        "WWWWWWWWW\n"
-        "0 WXW1W X\n"
-        "W   P   W\n"
-        "W A PA  W\n"
-        "WWWBWBWWW"
+        "WWPWW\n"
+        "0A A1\n"
+        "W   R\n"
+        "WBWXW"
     ),
     "recipes": [
         [0, 0, 0],
@@ -69,6 +68,7 @@ def run_worker(worker_index, args, init_method=None):
         env = OvercookedEnv(
             layout, max_steps=args.max_steps, agent_view_size=args.view_radius,
             random_reset=args.random_reset,
+            random_agent_positions=args.random_agent_positions,
         )
         teammate = AssemblyLineTeammate(role=args.role) if args.teammate_type == "heuristic" else None
 
@@ -117,9 +117,13 @@ def main():
     parser.add_argument("--value-coef", type=float, help="Critic loss weight.")
     parser.add_argument("--max-grad-norm", type=float, help="Gradient norm clipping limit.")
     parser.add_argument("--epochs", type=int, help="PPO passes over each rollout.")
+    parser.add_argument("--reward-shaping-horizon", type=int,
+                        help="Training environment steps over which preparation bonuses fade to zero; 0 disables them.")
     parser.add_argument("--print-every", type=int, help="Show kitchen 0's grid and last actions every N rollout steps; 0 disables it.")
     parser.add_argument("--random-reset", action=argparse.BooleanOptionalAction,
                         help="Randomize agent positions/directions, inventories, and pot/counter contents on reset.")
+    parser.add_argument("--random-agent-positions", action=argparse.BooleanOptionalAction,
+                        help="Randomize starting positions/directions within each agent's room.")
     parser.add_argument("--eval-every", type=int, help="Evaluate all three roles every N updates and at the end; 0 disables it.")
     parser.add_argument("--eval-batches", type=int, help="Evaluation batches per role; episodes = this value times total batch-size.")
     parser.add_argument("--eval-seed", type=int, help="Separate random seed for repeatable evaluation checks.")
@@ -136,6 +140,8 @@ def main():
         parser.error("print-every must be nonnegative.")
     if args.eval_every < 0:
         parser.error("eval-every must be nonnegative.")
+    if args.reward_shaping_horizon < 0:
+        parser.error("reward-shaping-horizon must be nonnegative.")
     workers = len(args.devices)
     # Equal splits give every worker the same number of backward calls and the
     # same weight in the averaged gradients, including the final minibatch.
