@@ -554,3 +554,32 @@ For claims about unfamiliar teammate variants, also keep teammate variants
 disjoint between classifier training and testing. Episode-ID splitting alone
 does not enforce that; use `fit_classifier` and `evaluate_classifier` on the
 separately prepared datasets.
+
+## Linear and nonlinear memory probes
+
+`overcookedv2/linear_probe.py` contains `LinearProbe` (one linear layer) and
+`NonlinearProbe` (128 inputs -> 64 hidden units -> ReLU -> class scores).
+Both use the same two functions: `fit_probe` trains with cross-entropy and
+small weight decay; `evaluate_probe` returns accuracy.
+
+Each input row is the frozen ego's representation at a selected decision:
+GRU `hidden`, or Transformer `memory["representation"]`. Stack these into
+`[N,128]` and provide correct response labels `[N]` as `torch.long`. Labels are
+the appropriate responses, not necessarily the actions the ego actually chose.
+Split by whole source episode before fitting.
+
+From Python with `overcookedv2` on the import path:
+
+```python
+from linear_probe import LinearProbe, NonlinearProbe, fit_probe, evaluate_probe
+
+probe = LinearProbe(num_classes=2)  # A/B for the toy.
+losses = fit_probe(probe, train_representations, train_labels)
+accuracy = evaluate_probe(probe, test_representations, test_labels)
+```
+
+Use `probe = NonlinearProbe(num_classes=2)` for the MLP version. Train the
+linear and nonlinear probes separately on the same episode-disjoint datasets.
+Representations are detached inside `fit_probe`, so gradients reach only the
+probe. Successful decoding shows accessibility to that probe, not that the ego
+uses the information to choose actions.
