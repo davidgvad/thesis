@@ -621,3 +621,46 @@ python3 overcookedv2/run_toy.py --delay-steps 194 --output runs/toy_gru_long.pt
 
 This runner trains the ego and critic; it does not fit the diagnostic classifiers
 or probes. Those use separate labelled data collected from a frozen ego.
+
+## Complete toy experiment
+
+```bash
+python3 overcookedv2/toy_experiment.py --output runs/toy_early
+python3 overcookedv2/toy_experiment.py --clue-timing late --output runs/toy_late
+```
+
+This script runs the existing pieces in order: train the shared GRU actor and
+critic with PPO; freeze them; collect fresh legal histories and decision-time
+representations; split those episodes into diagnostic training/test sets; train
+and test the current-observation/history classifiers and linear/nonlinear probes.
+The classifiers and probes all use the same held-out episodes, and ego return
+is reported on those episodes too.
+
+Use `--irrelevant-steps`, `--delay-steps`, and `--clue-accuracy` to configure the
+task. `--batch-size`, `--num-steps`, and `--updates` control PPO training. Defaults
+match `run_toy.py`. Diagnostics default to 2048 fresh episodes, an 80/20 split,
+10 fitting epochs, and minibatches of 128. Change these with
+`--diagnostic-episodes`, `--diagnostic-epochs`, and `--diagnostic-batch-size`.
+`--seed` and `--device` apply to the experiment.
+
+```bash
+# Small end-to-end plumbing check; two PPO updates are not enough to assess learning.
+python3 overcookedv2/toy_experiment.py --updates 2 --num-steps 22 --batch-size 32 \
+    --diagnostic-episodes 128 --diagnostic-epochs 2 --output runs/toy_quick
+```
+
+`results.json` contains the settings, PPO training curve, ego return, all four
+diagnostic accuracies, and a majority-label baseline. `experiment.pt` contains
+model weights, the legal-history dataset, frozen representations and labels,
+per-episode returns, and the shared train/test IDs. Representations are saved
+after processing the decision observation and before the final action/reward.
+Final feedback and the late terminal clue are excluded from diagnostic inputs.
+Separate diagnostic seeds avoid reusing PPO training episodes.
+
+To access the saved representations from Python:
+
+```python
+saved = torch.load("runs/toy_early/experiment.pt", map_location="cpu", weights_only=True)
+representations = saved["representations"]  # [N,128]
+labels = saved["histories"]["labels"]       # [N], correct A/B answers
+```
