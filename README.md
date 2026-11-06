@@ -1,12 +1,12 @@
-# Overcooked V2: GRU actor and PPO
+# Overcooked V2: GRU or Transformer actor with online PPO
 
 A batched PyTorch environment and a small recurrent PPO implementation.
 You can use the configurable Assembly Line heuristic or train two separate
 neural actors sharing one centralized critic.
 
-- overcookedv2/models.py: the CNN encoder, GRU actor, and separate GRU critic.
+- overcookedv2/models.py: the CNN encoder, GRU and Transformer actors, and separate GRU critic.
 - overcookedv2/ppo.py: critic inputs, rollout collection, GAE, and PPO updates.
-- overcookedv2/train_gru.py: training, evaluation, logging, and model saving.
+- overcookedv2/train.py: training, evaluation, logging, and model saving.
 - overcookedv2/teammates.py: the Assembly Line heuristic teammate.
 - overcookedv2/test_teammates.py: deliveries, routing, batching, and PPO integration checks.
 
@@ -15,7 +15,7 @@ reward, and its own memory. The critic separately sees the full grid, the true
 recipe, pot and button timers, both agents, and normalized remaining time.
 Research labels are logging metadata only; neither network receives them.
 
-Both networks use the CNN from the brief. Their GRUs have input and hidden
+The actor and critic use the CNN from the brief. Their GRUs have input and hidden
 size 128. GRUCell applies one GRU layer one timestep at a time. Each kitchen
 has independent actor and critic memories shaped [B, 128].
 
@@ -31,7 +31,7 @@ Use a categorical distribution to sample from the actor's logits.
 
 From Python running in the overcookedv2 folder, use your existing environment:
 
-    from train_gru import train, evaluate
+    from train import train, evaluate
     from ppo import PPOConfig
     from teammates import AssemblyLineTeammate
 
@@ -47,15 +47,65 @@ integer actions shaped [B] on the environment's device. Neural teammates use
 the actor interface described below, so their observations, previous actions,
 and memories stay separate from the ego's.
 
+## Online Transformer actor
+
+Use `--actor-type transformer` to replace the actor's GRU with one causal
+Transformer block. It learns directly from fresh environment rollouts using
+the same PPO loss. It requires no offline dataset or expert action labels.
+GRU remains the default (`--actor-type gru`), and the centralized GRU critic
+stays the same in both modes.
+
+```bash
+NCCL_P2P_DISABLE=1 python3 -u overcookedv2/run.py \
+    --devices cuda:0 cuda:1 cuda:2 cuda:3 --actor-type transformer \
+    --log-dir runs/cramped_transformer_seed0
+```
+
+This command keeps the default heuristic runner. Add `--teammate-type neural`
+to train two separate Transformer actors with the shared critic. Each has
+its own weights, optimizer, and history.
+
+The actor keeps the existing CNN, previous-action/reward inputs, 135-to-128
+projection, and action head. Its memory block has width 128, four attention
+heads, a 128-wide ReLU feed-forward layer, pre-layer normalization, fixed
+sinusoidal positions, and zero dropout. The block has about 100K parameters,
+close to the GRU's 99K; this does not imply equal runtime or memory use.
+
+`PPOConfig.context_length = 400` is the maximum number of tokens, including
+the current timestep. Use `--context-length` to change it. One token represents
+one observation, previous action, and previous reward. A 400-token window
+covers the current default episode. Longer episodes may outlive that window.
+Attention cannot read future tokens or tokens from an earlier episode.
+
+During collection, memory is a dictionary of recent raw observations, previous
+actions/rewards, episode boundaries, positions, and cached encoded tokens.
+Only the new observation passes through the CNN on each step. The buffer
+continues across rollout boundaries. At the next collection, cached tokens
+are refreshed because PPO may have changed the encoder's weights.
+
+During PPO updates, each minibatch includes the saved raw prefix from before
+the rollout and the rollout's inputs. The encoder and Transformer are recomputed
+with current weights, with the same context limit and episode/causal masks used
+online. No gradients propagate through the collection cache. Context does not
+reset simply because the 256-step rollout has ended.
+
+The context itself is not copied into every timestep's trace. `actor_hidden`
+records the current 128-feature decision representation instead. Resolved
+`actor_type` and `context_length` are saved in config.json and checkpoint.pt.
+When loading a Transformer checkpoint, construct
+`TransformerActor(checkpoint["actor_obs_shape"], checkpoint["ppo"]["context_length"])`
+before loading `checkpoint["actor"]`; the actor class is selected by
+`checkpoint["ppo"].get("actor_type", "gru")` for compatibility with older runs.
+
 ## Two learning neural actors
 
-Use `--teammate-type neural` to train a second GRU actor with its own weights
+Use `--teammate-type neural` to train a second actor with its own weights
 and Adam optimizer. Both actors use the same team advantages from one shared
 centralized critic. Every minibatch updates actor 0, actor 1, then the critic
 once. This is a MAPPO-style setup with separate actor parameters.
 
 ```bash
-NCCL_P2P_DISABLE=1 python3 -u overcookedv2/run_gru.py \
+NCCL_P2P_DISABLE=1 python3 -u overcookedv2/run.py \
     --devices cuda:0 cuda:1 cuda:2 cuda:3 --teammate-type neural \
     --log-dir runs/two_learning_actors
 ```
@@ -85,9 +135,12 @@ forward(obs, previous_action, previous_reward, hidden, episode_start,
 ```
 
 It accepts a single timestep [B,...] and an ordered training sequence [T,B,...].
-The actor resets its own memory using episode_start. Memory is either None
-(for a feed-forward policy) or a tensor shaped [B,...], with the kitchen batch
-first; it is not shared between actors. Other architectures need an adapter
+The actor resets its own memory using episode_start. Memory is None for a
+feed-forward policy, a tensor shaped [B,...] for the GRU, or a dictionary of
+tensors with the kitchen batch first for the Transformer. Dictionary memory
+includes a small [B,128] `representation` for traces; `tokens` is an optional
+collection cache discarded between rollouts. Memory is not shared between actors.
+Other architectures need an adapter
 if their interface differs. collect_rollout and evaluate also accept a
 teammate_actor for neural-pair rollouts without any weight updates.
 
@@ -254,12 +307,12 @@ All launcher and PPO defaults now live in `PPOConfig` in `overcookedv2/ppo.py`.
 The launcher reads those defaults and lets command-line arguments override them.
 For example, `--learning-rate 0.0001 --epochs 4 --batch-size 128` changes only
 those three settings. Omitted arguments keep their `PPOConfig` defaults. Run
-`python3 overcookedv2/run_gru.py --help` to list every option and its default.
+`python3 overcookedv2/run.py --help` to list every option and its default.
 The current default is 4 PPO epochs per rollout; `--updates` separately controls
 how many collect-rollout/train cycles to run. The resolved settings are saved
 with the run, so CLI overrides are recorded too.
 
-`overcookedv2/run_gru.py` distributes ONE training run over devices on one server.
+`overcookedv2/run.py` distributes ONE training run over devices on one server.
 Each GPU has its own kitchens and copies of the training networks (two actors
 and one critic in neural mode). Each network's copies start with identical
 weights across workers; actor 0 and actor 1 remain distinct networks.
@@ -270,7 +323,7 @@ that same update, so the weights stay synchronized.
 From the repository root, run this command **once** inside your GPU allocation:
 
 ```bash
-python3 overcookedv2/run_gru.py --devices cuda:0 cuda:1 cuda:2 cuda:3 \
+python3 overcookedv2/run.py --devices cuda:0 cuda:1 cuda:2 cuda:3 \
     --batch-size 128 --minibatch-size 16 --updates 10 \
     --cpu-threads 4 --log-dir runs/shared_gpu_pilot
 ```
@@ -393,7 +446,7 @@ response-based teammate populations remain a separate part of the experiment.
 A small CPU test of the shared-policy launcher:
 
 ```bash
-python3 overcookedv2/run_gru.py --devices cpu cpu --batch-size 4 \
+python3 overcookedv2/run.py --devices cpu cpu --batch-size 4 \
     --minibatch-size 2 --max-steps 4 --updates 2 --cpu-threads 1 \
     --log-dir runs/shared_cpu_check
 ```
@@ -403,8 +456,8 @@ Existing calls to `train(env, teammate, ...)` continue to use one device by
 default. The launcher initializes distributed communication and passes
 `distributed=True` only when multiple devices are selected.
 
-For reading the changes, start with `run_gru.py` (split kitchens and connect
-workers), then `train_gru.py` (create DDP wrappers and combine logging), then
+For reading the changes, start with `run.py` (split kitchens and connect
+workers), then `train.py` (create DDP wrappers and combine logging), then
 `ppo.py` (global advantage normalization and the usual PPO updates). During
 rollout collection each worker uses its local model directly; gradients are
 synchronized only during training updates.

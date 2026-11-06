@@ -33,6 +33,8 @@ class PPOConfig:
     num_steps: int = 256  # Steps per kitchen collected before each PPO update.
     max_steps: int = 400  # Episode length, independent of rollout length.
     cpu_threads: int = 4
+    actor_type: str = "gru"  # "transformer" uses causal attention over recent history.
+    context_length: int = 400  # Transformer tokens, including the current timestep.
     role: str = "runner"
     teammate_type: str = "heuristic"  # "neural" trains a separate second actor.
     layout: Optional[str] = None  # None selects the launcher's example kitchen.
@@ -188,6 +190,12 @@ def collect_rollout(
     obs = env.get_obs(state)
     if print_every:
         print_kitchen(state, ego_index, step=0, steps=steps)
+    # A Transformer caches encoded tokens during collection. Refresh them at
+    # each rollout start because PPO may have changed the encoder's weights.
+    if isinstance(actor_hidden, dict):
+        actor_hidden = {key: value for key, value in actor_hidden.items() if key != "tokens"}
+    if isinstance(teammate_hidden, dict):
+        teammate_hidden = {key: value for key, value in teammate_hidden.items() if key != "tokens"}
     initial_actor_hidden = actor_hidden
     initial_teammate_hidden = teammate_hidden
     initial_critic_hidden = critic_hidden
@@ -231,7 +239,9 @@ def collect_rollout(
                 "obs": teammate_obs, "previous_action": previous_teammate_action,
                 "actions": teammate_action,
                 "log_prob": teammate_distribution.log_prob(teammate_action),
-                "actor_hidden": teammate_hidden, "action_probs": teammate_distribution.probs,
+                "actor_hidden": (teammate_hidden["representation"]
+                                 if isinstance(teammate_hidden, dict) else teammate_hidden),
+                "action_probs": teammate_distribution.probs,
             }
             for key, value in teammate_transition.items():
                 teammate_data[key].append(value)
@@ -255,7 +265,10 @@ def collect_rollout(
             "episode_start": episode_start, "actions": action,
             "joint_actions": joint_actions, "log_prob": distribution.log_prob(action),
             "values": values, "rewards": reward, "training_rewards": training_reward, "done": done,
-            "actor_hidden": actor_hidden, "action_probs": distribution.probs,
+            # Keep one small representation per step, not a copy of the context.
+            "actor_hidden": (actor_hidden["representation"]
+                             if isinstance(actor_hidden, dict) else actor_hidden),
+            "action_probs": distribution.probs,
         }
         for key, value in transition.items():
             data[key].append(value)
@@ -331,7 +344,10 @@ def normalize_advantages(advantages, distributed=False):
 def _update_actor(actor, optimizer, rollout, kitchens, advantages, config):
     """One PPO actor step; reusable for either actor's own trajectory."""
     hidden = rollout.get("initial_actor_hidden")
-    hidden = hidden[kitchens] if hidden is not None else None
+    if isinstance(hidden, dict):
+        hidden = {key: value[kitchens] for key, value in hidden.items()}
+    elif hidden is not None:
+        hidden = hidden[kitchens]
     logits, _ = actor(
         rollout["obs"][:, kitchens],
         rollout["previous_action"][:, kitchens],
@@ -395,8 +411,8 @@ def ppo_update(
         order = torch.randperm(batch_size, device=advantages.device)
         for start in range(0, batch_size, minibatch_size):
             kitchens = order[start:start + minibatch_size]
-            # Leading dimensions remain [T, selected kitchens]. The GRU is
-            # recomputed with gradients from the saved memory at its start.
+            # Keep [T, selected kitchens]. GRUs replay from saved hidden states;
+            # Transformers replay the earlier raw context with current weights.
             actor_loss, entropy = _update_actor(
                 actor, actor_optimizer, rollout, kitchens, advantages, config,
             )

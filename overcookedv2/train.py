@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from models import GRUActor, CentralCritic
+from models import GRUActor, TransformerActor, CentralCritic
 from ppo import PPOConfig, collect_rollout, ppo_update
 from teammates import AssemblyLineTeammate
 
@@ -22,7 +22,8 @@ def train(
 
     Supply custom actor/teammate_actor models using the GRUActor interface.
     A supplied teammate_actor selects neural mode and is updated in place.
-    Otherwise config.teammate_type chooses a heuristic or a fresh GRU partner.
+    Otherwise config.teammate_type chooses a heuristic or a fresh neural partner.
+    config.actor_type selects GRU or online Transformer for newly created actors.
     The return stays (actor, critic, history); both actors are saved in neural mode.
     Omitted updates and seed use their values from config.
     Metadata is only logged, never passed to either network.
@@ -34,6 +35,10 @@ def train(
         config = replace(config, teammate_type="neural")
     if config.teammate_type not in ("heuristic", "neural"):
         raise ValueError("teammate_type must be 'heuristic' or 'neural'.")
+    if config.actor_type not in ("gru", "transformer"):
+        raise ValueError("actor_type must be 'gru' or 'transformer'.")
+    if config.context_length < 1:
+        raise ValueError("context_length must be positive.")
     updates = config.updates if updates is None else updates
     seed = config.seed if seed is None else seed
     if updates < 1:
@@ -49,14 +54,20 @@ def train(
     is_main = rank == 0
     torch.manual_seed(seed)
     device = env.layout.grid.device
-    actor = GRUActor(env.obs_shape) if actor is None else actor
+
+    def make_actor():
+        if config.actor_type == "transformer":
+            return TransformerActor(env.obs_shape, config.context_length)
+        return GRUActor(env.obs_shape)
+
+    actor = make_actor() if actor is None else actor
     actor = actor.to(device)
     critic_shape = (
         env.layout.grid.shape[1], env.layout.grid.shape[2], env.obs_channels + 1
     )
     critic = CentralCritic(critic_shape).to(device)
     if config.teammate_type == "neural":
-        teammate_actor = GRUActor(env.obs_shape) if teammate_actor is None else teammate_actor
+        teammate_actor = make_actor() if teammate_actor is None else teammate_actor
         teammate_actor = teammate_actor.to(device)
         actor_parameters = {id(parameter) for parameter in actor.parameters()}
         if actor_parameters.intersection(id(parameter) for parameter in teammate_actor.parameters()):

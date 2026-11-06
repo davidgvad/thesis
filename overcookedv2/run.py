@@ -14,7 +14,7 @@ from torch.multiprocessing import spawn
 from layouts import Layout
 from ppo import PPOConfig
 from teammates import AssemblyLineTeammate
-from train_gru import train
+from train import train
 from v2 import OvercookedEnv
 
 
@@ -102,6 +102,10 @@ def main():
     parser.add_argument("--num-steps", type=int, help="Steps collected per kitchen before each PPO update.")
     parser.add_argument("--max-steps", type=int, help="Steps per episode.")
     parser.add_argument("--cpu-threads", type=int, help="PyTorch CPU threads per worker.")
+    parser.add_argument("--actor-type", choices=("gru", "transformer"),
+                        help="Online PPO actor architecture; the centralized critic stays the same.")
+    parser.add_argument("--context-length", type=int,
+                        help="Transformer history window in timesteps, including the current observation.")
     parser.add_argument("--role", choices=("runner", "deliverer", "flexible"), help="Fixed teammate role.")
     parser.add_argument("--teammate-type", choices=("heuristic", "neural"),
                         help="Use a fixed heuristic or train a separate neural teammate with the shared critic.")
@@ -131,7 +135,7 @@ def main():
     parser.set_defaults(**asdict(PPOConfig()))
     args = PPOConfig(**vars(parser.parse_args()))
 
-    for name in ("batch_size", "updates", "minibatch_size", "num_steps", "max_steps", "cpu_threads", "epochs", "timeout_minutes", "eval_batches"):
+    for name in ("batch_size", "updates", "minibatch_size", "num_steps", "max_steps", "cpu_threads", "epochs", "timeout_minutes", "eval_batches", "context_length"):
         if getattr(args, name) < 1:
             parser.error(f"{name.replace('_', '-')} must be positive.")
     if args.view_radius is not None and args.view_radius < 0:
@@ -189,7 +193,7 @@ def main():
     if run_dir.exists():
         parser.error(f"{run_dir} already exists; choose a new --log-dir or --seed.")
     run_dir.mkdir(parents=True, exist_ok=False)
-    print(f"Teammate={args.teammate_type}, seed={args.seed}, output={run_dir}", flush=True)
+    print(f"Actor={args.actor_type}, teammate={args.teammate_type}, seed={args.seed}, output={run_dir}", flush=True)
 
     if workers == 1:
         run_worker(0, args)
