@@ -1,4 +1,4 @@
-"""Train a toy GRU, then measure history information and probe its frozen memory."""
+"""Train a toy ego, then measure history information and probe its frozen memory."""
 
 import argparse
 import json
@@ -33,7 +33,8 @@ def collect_diagnostics(actor, env):
         logits, hidden = actor(obs, previous_action, previous_reward, hidden, starts)
         if state.time == env.decision_step:
             # Save memory before sampling the final action or seeing its reward.
-            representations = hidden.detach().cpu()
+            representation = hidden["representation"] if isinstance(hidden, dict) else hidden
+            representations = representation.detach().cpu()
             labels = state.condition.cpu().clone()  # A/B targets, never actor inputs.
         allowed = env.action_mask(state)
         distribution = Categorical(logits=logits.masked_fill(~allowed, -torch.inf))
@@ -62,6 +63,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=256, help="Parallel PPO environments.")
     parser.add_argument("--num-steps", type=int, default=200, help="Steps collected per PPO update.")
     parser.add_argument("--updates", type=int, default=30)
+    parser.add_argument("--actor-type", choices=("gru", "transformer"), default="gru")
+    parser.add_argument("--context-length", type=int, default=400)
     parser.add_argument("--diagnostic-episodes", type=int, default=2048)
     parser.add_argument("--diagnostic-epochs", type=int, default=10)
     parser.add_argument("--diagnostic-batch-size", type=int, default=128)
@@ -77,9 +80,12 @@ def main():
         "device": args.device,
     }
 
-    # 1. Train the shared GRU actor and critic using rewards only.
+    # 1. Train the selected shared actor and GRU critic using rewards only.
     env = MemoryPOMDP(batch_size=args.batch_size, seed=args.seed, **env_settings)
-    actor, critic, training = train_toy(env, updates=args.updates, num_steps=args.num_steps)
+    actor, critic, training = train_toy(
+        env, updates=args.updates, num_steps=args.num_steps,
+        actor_type=args.actor_type, context_length=args.context_length,
+    )
 
     # 2. Freeze the ego and collect new episodes, separate from PPO training.
     for model in (actor, critic):

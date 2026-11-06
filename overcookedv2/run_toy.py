@@ -1,4 +1,4 @@
-"""Train a GRU ego and separate GRU critic on the toy POMDP using PPO."""
+"""Train a GRU or Transformer ego with a separate GRU critic on the toy POMDP."""
 
 import argparse
 from pathlib import Path
@@ -7,19 +7,23 @@ import torch
 from torch import nn
 from torch.distributions import Categorical
 
-from models import GRUActor, CentralCritic
+from models import GRUActor, TransformerActor, CentralCritic
 from ppo import compute_gae
 from toy_pomdp import MemoryPOMDP
 
 
-def train_toy(env, updates=30, num_steps=200):
+def train_toy(env, updates=30, num_steps=200, actor_type="gru", context_length=400):
     learning_rate = 3e-4
     epochs = 4
     minibatch_size = 64  # Complete environment sequences per optimizer step.
     clip = 0.2
     device = env.device
     batch_size = env.batch_size
-    actor = GRUActor(obs_shape=(3,), num_actions=3).to(device)
+    if actor_type == "transformer":
+        actor = TransformerActor((3,), context_length=context_length, num_actions=3)
+    else:
+        actor = GRUActor((3,), num_actions=3)
+    actor = actor.to(device)
     critic = CentralCritic(obs_shape=(3,)).to(device)
     actor_optimizer = torch.optim.Adam(actor.parameters(), lr=learning_rate)
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=learning_rate)
@@ -30,8 +34,12 @@ def train_toy(env, updates=30, num_steps=200):
     episode_start = torch.ones(batch_size, dtype=torch.bool, device=device)
     actor_hidden = critic_hidden = None
     history = []
+    print(f"Actor={actor_type} | Critic=gru", flush=True)
 
     for update in range(1, updates + 1):
+        if isinstance(actor_hidden, dict):
+            # PPO changed the encoder: refresh cached features from the raw history.
+            actor_hidden = {key: value for key, value in actor_hidden.items() if key != "tokens"}
         initial_actor_hidden = actor_hidden
         initial_critic_hidden = critic_hidden
         data = {key: [] for key in (
@@ -70,7 +78,7 @@ def train_toy(env, updates=30, num_steps=200):
                 episode_start = done
                 previous_action = actions.masked_fill(done, 0)
                 previous_reward = rewards.masked_fill(done, 0)
-                # run_gru clears each model's memory at episode_start on the next call.
+                # GRUs reset at episode_start; Transformer attention blocks older episodes.
 
             next_value, _ = critic(env.get_obs(state), critic_hidden, episode_start)
             next_value = next_value.masked_fill(episode_start, 0)
@@ -89,7 +97,11 @@ def train_toy(env, updates=30, num_steps=200):
             for indices in order.split(minibatch_size):
                 starts = rollout["episode_start"][:, indices]
                 if has_decisions:
-                    hidden = initial_actor_hidden[indices] if initial_actor_hidden is not None else None
+                    hidden = initial_actor_hidden
+                    if isinstance(hidden, dict):
+                        hidden = {key: value[indices] for key, value in hidden.items()}
+                    elif hidden is not None:
+                        hidden = hidden[indices]
                     logits, _ = actor(
                         rollout["obs"][:, indices], rollout["previous_action"][:, indices],
                         rollout["previous_reward"][:, indices], hidden, starts,
@@ -134,13 +146,17 @@ def main():
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-steps", type=int, default=200)
     parser.add_argument("--updates", type=int, default=30)
+    parser.add_argument("--actor-type", choices=("gru", "transformer"), default="gru")
+    parser.add_argument("--context-length", type=int, default=400)
     parser.add_argument("--delay-steps", type=int, default=5)
     parser.add_argument("--clue-timing", choices=("early", "late"), default="early")
     parser.add_argument("--clue-accuracy", type=float, default=1.0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--output", type=Path, default=Path("runs/toy_gru.pt"))
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.output is None:
+        args.output = Path(f"runs/toy_{args.actor_type}.pt")
     torch.set_num_threads(1)
     torch.manual_seed(args.seed)
     env = MemoryPOMDP(
@@ -148,7 +164,10 @@ def main():
         clue_timing=args.clue_timing, clue_accuracy=args.clue_accuracy,
         device=args.device, seed=args.seed,
     )
-    actor, critic, history = train_toy(env, updates=args.updates, num_steps=args.num_steps)
+    actor, critic, history = train_toy(
+        env, updates=args.updates, num_steps=args.num_steps,
+        actor_type=args.actor_type, context_length=args.context_length,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "actor": actor.state_dict(), "critic": critic.state_dict(), "history": history,

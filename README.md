@@ -488,7 +488,7 @@ WAIT=2. `step(state, actions)` returns `(next_state, next_obs, reward, done)`.
 After completion, explicitly call `reset()` and clear policy memory.
 
 The environment script above is a scripted check. `run_toy.py` below trains
-a GRU actor and critic. Transformer toy training and targeted memory/action-use
+a GRU or Transformer actor with a GRU critic. Targeted memory/action-use
 interventions remain separate work.
 
 ## History-information classifier
@@ -584,31 +584,35 @@ Representations are detached inside `fit_probe`, so gradients reach only the
 probe. Successful decoding shows accessibility to that probe, not that the ego
 uses the information to choose actions.
 
-## Train a GRU on the toy POMDP
+## Train a GRU or Transformer on the toy POMDP
 
 ```bash
 python3 overcookedv2/run_toy.py
 ```
 
-`run_toy.py` uses the same `GRUActor` and `CentralCritic` classes from
-`models.py` as Overcooked. It creates `GRUActor((3,), num_actions=3)` and
-`CentralCritic((3,))`: vector observations select a small MLP encoder, while
-grid observations select the existing CNN. The GRUs and head structure are
-shared; Overcooked keeps its six-action default. Both toy networks receive only
-legal observations; the actor also receives its previous action and reward.
-Training uses PPO, without response labels or shaping rewards.
+`run_toy.py` uses the same `GRUActor`, `TransformerActor`, and `CentralCritic`
+classes from `models.py` as Overcooked. GRU is the default actor; select the
+Transformer with `--actor-type transformer`. The critic remains a GRU.
+Toy actors use `(3,)` vector observations and three actions; grid observations
+select the existing CNN, and Overcooked keeps its six-action default. Both toy
+networks receive only legal observations; the actor also receives its previous
+action and reward. Training uses PPO, without response labels or shaping rewards.
 
 Defaults: 256 parallel environments, 200 collected steps per update, 30 updates,
 four PPO epochs, and minibatches of 64 complete environment sequences. The toy
 still has 11-step episodes: finished episodes reset within a collection, and
 unfinished episodes continue into the next collection. Saved episode boundaries
-reset GRU memory during collection and PPO replay. Action masks are applied
+reset GRU memory or block attention to previous episodes during collection and
+PPO replay. Action masks are applied
 both when sampling actions and when recomputing their probabilities. Only A/B
 decisions contribute to the actor loss; the critic learns from all timesteps.
 The toy's advantages stay on their original scale with its bounded 0/1 rewards.
 
 Progress prints one line per update. The actor, critic, settings, and training
-returns are saved in `runs/toy_gru.pt`. Use `--device cuda:0` for one GPU.
+returns are saved in `runs/toy_gru.pt` or `runs/toy_transformer.pt` according to
+the actor selection. Use `--device cuda:0` for one GPU. Transformer context is
+controlled by `--context-length` (default 400 timesteps). History continues
+across collections, with cached features refreshed after PPO changes the encoder.
 
 ```bash
 # Short check.
@@ -627,10 +631,18 @@ or probes. Those use separate labelled data collected from a frozen ego.
 ```bash
 python3 overcookedv2/toy_experiment.py --output runs/toy_early
 python3 overcookedv2/toy_experiment.py --clue-timing late --output runs/toy_late
+python3 overcookedv2/toy_experiment.py --actor-type transformer --output runs/toy_transformer_early
+python3 overcookedv2/toy_experiment.py --actor-type transformer --clue-timing late --output runs/toy_transformer_late
 ```
 
-This script runs the existing pieces in order: train the shared GRU actor and
-critic with PPO; freeze them; collect fresh legal histories and decision-time
+Use `--actor-type gru|transformer` to select the ego. Both choices use a GRU
+critic and the same diagnostic models. For Transformer probes, the saved vector
+is `memory["representation"]` at the decision. `--context-length` limits the
+Transformer ego's history window; it does not limit the history classifier's
+legal input history. GRU remains the default.
+
+This script runs the existing pieces in order: train the selected shared actor
+and GRU critic with PPO; freeze them; collect fresh legal histories and decision-time
 representations; split those episodes into diagnostic training/test sets; train
 and test the current-observation/history classifiers and linear/nonlinear probes.
 The classifiers and probes all use the same held-out episodes, and ego return

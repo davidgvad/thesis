@@ -98,18 +98,19 @@ class GRUActor(nn.Module):
 class TransformerActor(nn.Module):
     """Same actor interface as GRUActor, with a dictionary of recent inputs.
 
-    One timestep is one token: CNN(observation), previous action, previous reward.
+    One timestep is one token: encoded observation, previous action, previous reward.
     Memory keeps raw inputs so PPO can re-encode history with the current weights.
-    During collection, cached tokens avoid running the CNN on old observations.
+    During collection, cached tokens avoid re-encoding old observations.
     """
 
-    def __init__(self, obs_shape, context_length=400):
+    def __init__(self, obs_shape, context_length=400, num_actions=6):
         super().__init__()
         if context_length < 1:
             raise ValueError("context_length must be positive.")
         self.context_length = context_length
-        self.encoder = CNNEncoder(obs_shape)
-        self.input_layer = nn.Sequential(nn.Linear(135, 128), nn.ReLU())
+        self.num_actions = num_actions
+        self.encoder = make_encoder(obs_shape)
+        self.input_layer = nn.Sequential(nn.Linear(128 + num_actions + 1, 128), nn.ReLU())
 
         # One pre-normalized Transformer block. Four heads each use 32 features.
         self.attention_norm = nn.LayerNorm(128)
@@ -120,7 +121,7 @@ class TransformerActor(nn.Module):
         )
         self.output_norm = nn.LayerNorm(128)
         self.action_head = nn.Sequential(
-            nn.Linear(128, 128), nn.ReLU(), nn.Linear(128, 6),
+            nn.Linear(128, 128), nn.ReLU(), nn.Linear(128, num_actions),
         )
         # Fixed sinusoidal positions add no learned parameters.
         frequencies = torch.exp(-math.log(10000) * torch.arange(0, 128, 2) / 128)
@@ -128,7 +129,7 @@ class TransformerActor(nn.Module):
 
     def _encode_tokens(self, obs, previous_action, previous_reward, episode_start):
         features = self.encoder(obs)
-        actions = F.one_hot(previous_action.long(), 6).float()
+        actions = F.one_hot(previous_action.long(), self.num_actions).float()
         actions = actions.masked_fill(episode_start[..., None], 0)
         rewards = previous_reward.masked_fill(episode_start, 0)[..., None]
         return self.input_layer(torch.cat([features, actions, rewards], dim=-1))
@@ -138,7 +139,7 @@ class TransformerActor(nn.Module):
         reset_memory=False,
     ):
         # The public interface uses [T,B,...]; attention uses [B,T,...].
-        single_step = obs.ndim == 4
+        single_step = previous_action.ndim == 1
         if single_step:
             obs = obs[None]
             previous_action = previous_action[None]
