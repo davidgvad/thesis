@@ -33,6 +33,15 @@ class CNNEncoder(nn.Module):
         return features.reshape(*batch_shape, 128)
 
 
+def make_encoder(obs_shape):
+    """Vectors use a small MLP; grids use the kitchen CNN. Both output 128 features."""
+    if len(obs_shape) == 1:
+        return nn.Sequential(
+            nn.Linear(obs_shape[0], 128), nn.ReLU(), nn.LayerNorm(128),
+        )
+    return CNNEncoder(obs_shape)
+
+
 def run_gru(gru, inputs, hidden, episode_start):
     """Run one timestep or an ordered sequence, reset finished kitchens."""
     single_step = inputs.ndim == 2
@@ -58,14 +67,15 @@ def run_gru(gru, inputs, hidden, episode_start):
 class GRUActor(nn.Module):
     """Uses only the ego observation, previous action/reward, and its memory."""
 
-    def __init__(self, obs_shape):
+    def __init__(self, obs_shape, num_actions=6):
         super().__init__()
-        self.encoder = CNNEncoder(obs_shape)
-        self.input_layer = nn.Sequential(nn.Linear(135, 128), nn.ReLU())
+        self.num_actions = num_actions
+        self.encoder = make_encoder(obs_shape)
+        self.input_layer = nn.Sequential(nn.Linear(128 + num_actions + 1, 128), nn.ReLU())
         # GRUCell is one GRU layer, applied timestep by timestep.
         self.gru = nn.GRUCell(128, 128)
         self.action_head = nn.Sequential(
-            nn.Linear(128, 128), nn.ReLU(), nn.Linear(128, 6)
+            nn.Linear(128, 128), nn.ReLU(), nn.Linear(128, num_actions)
         )
 
     def forward(
@@ -73,7 +83,7 @@ class GRUActor(nn.Module):
         reset_memory=False,
     ):
         features = self.encoder(obs)
-        action_features = F.one_hot(previous_action.long(), 6).float()
+        action_features = F.one_hot(previous_action.long(), self.num_actions).float()
         action_features = action_features.masked_fill(episode_start[..., None], 0)
         reward_feature = previous_reward.masked_fill(episode_start, 0)[..., None]
         inputs = torch.cat([features, action_features, reward_feature], dim=-1)
@@ -210,11 +220,11 @@ class TransformerActor(nn.Module):
         return (logits[0] if single_step else logits), memory
 
 class CentralCritic(nn.Module):
-    """Independent network: full kitchen input -> one team value per kitchen."""
+    """Independent GRU value network for grid or vector observations."""
 
     def __init__(self, obs_shape):
         super().__init__()
-        self.encoder = CNNEncoder(obs_shape)
+        self.encoder = make_encoder(obs_shape)
         self.gru = nn.GRUCell(128, 128)
         self.value_head = nn.Sequential(
             nn.Linear(128, 128), nn.ReLU(), nn.Linear(128, 1)

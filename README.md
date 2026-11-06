@@ -487,9 +487,9 @@ actions; mask other policy logits to negative infinity. Actions are A=0, B=1,
 WAIT=2. `step(state, actions)` returns `(next_state, next_obs, reward, done)`.
 After completion, explicitly call `reset()` and clear policy memory.
 
-This adds the environment and sanity checks only. GRU/Transformer training,
-probes, and agent memory/action-use failure interventions are separate work;
-the existing Overcooked training entry point is unchanged.
+The environment script above is a scripted check. `run_toy.py` below trains
+a GRU actor and critic. Transformer toy training and targeted memory/action-use
+interventions remain separate work.
 
 ## History-information classifier
 
@@ -583,3 +583,41 @@ linear and nonlinear probes separately on the same episode-disjoint datasets.
 Representations are detached inside `fit_probe`, so gradients reach only the
 probe. Successful decoding shows accessibility to that probe, not that the ego
 uses the information to choose actions.
+
+## Train a GRU on the toy POMDP
+
+```bash
+python3 overcookedv2/run_toy.py
+```
+
+`run_toy.py` uses the same `GRUActor` and `CentralCritic` classes from
+`models.py` as Overcooked. It creates `GRUActor((3,), num_actions=3)` and
+`CentralCritic((3,))`: vector observations select a small MLP encoder, while
+grid observations select the existing CNN. The GRUs and head structure are
+shared; Overcooked keeps its six-action default. Both toy networks receive only
+legal observations; the actor also receives its previous action and reward.
+Training uses PPO, without response labels or shaping rewards.
+
+Defaults: 256 parallel environments, 200 collected steps per update, 30 updates,
+four PPO epochs, and minibatches of 64 complete environment sequences. The toy
+still has 11-step episodes: finished episodes reset within a collection, and
+unfinished episodes continue into the next collection. Saved episode boundaries
+reset GRU memory during collection and PPO replay. Action masks are applied
+both when sampling actions and when recomputing their probabilities. Only A/B
+decisions contribute to the actor loss; the critic learns from all timesteps.
+The toy's advantages stay on their original scale with its bounded 0/1 rewards.
+
+Progress prints one line per update. The actor, critic, settings, and training
+returns are saved in `runs/toy_gru.pt`. Use `--device cuda:0` for one GPU.
+
+```bash
+# Short check.
+python3 overcookedv2/run_toy.py --updates 2 --num-steps 22 --batch-size 32 \
+    --output runs/toy_gru_check.pt
+
+# Make each episode 200 steps long: 4 blank + 1 clue + 194 delay + 1 decision.
+python3 overcookedv2/run_toy.py --delay-steps 194 --output runs/toy_gru_long.pt
+```
+
+This runner trains the ego and critic; it does not fit the diagnostic classifiers
+or probes. Those use separate labelled data collected from a frozen ego.
