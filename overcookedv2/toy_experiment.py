@@ -8,7 +8,7 @@ import torch
 from torch.distributions import Categorical
 
 from toy_pomdp import MemoryPOMDP
-from run_toy import train_toy
+from run_toy import train_toy, evaluate_memory_reset
 from history_classifier import (
     HistoryClassifier, split_by_episode, fit_classifier, evaluate_classifier,
 )
@@ -65,6 +65,8 @@ def main():
     parser.add_argument("--updates", type=int, default=30)
     parser.add_argument("--actor-type", choices=("gru", "transformer"), default="gru")
     parser.add_argument("--context-length", type=int, default=400)
+    parser.add_argument("--reset-before-decision", action="store_true",
+                        help="Also compare the frozen ego with its decision-time memory cleared.")
     parser.add_argument("--diagnostic-episodes", type=int, default=2048)
     parser.add_argument("--diagnostic-epochs", type=int, default=10)
     parser.add_argument("--diagnostic-batch-size", type=int, default=128)
@@ -137,15 +139,22 @@ def main():
 
     majority = train["labels"].bincount(minlength=2).argmax()
     scores["majority_baseline_accuracy"] = (test["labels"] == majority).float().mean().item()
+    memory_reset = None
+    if args.reset_before_decision:
+        diagnostic_env.generator.manual_seed(args.seed + 10000)
+        torch.manual_seed(args.seed + 20000)
+        memory_reset = evaluate_memory_reset(actor, diagnostic_env)
     settings = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / "results.json").open("w") as file:
         json.dump({"settings": settings, "scores": scores, "training": training,
+                   "memory_reset": memory_reset,
                    "diagnostic_train_episodes": train_ids.numel(),
                    "diagnostic_test_episodes": test_ids.numel()}, file, indent=2)
     torch.save({
         "settings": settings, "weights": weights, "histories": data,
         "representations": representations, "episode_returns": returns,
+        "memory_reset": memory_reset,
         "train_ids": train_ids, "test_ids": test_ids,
     }, args.output / "experiment.pt")
     print(f"Saved results and models to {args.output}")

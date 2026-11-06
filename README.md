@@ -626,6 +626,20 @@ python3 overcookedv2/run_toy.py --delay-steps 194 --output runs/toy_gru_long.pt
 This runner trains the ego and critic; it does not fit the diagnostic classifiers
 or probes. Those use separate labelled data collected from a frozen ego.
 
+Add `--reset-before-decision` to compare the frozen actor with intact memory and
+with memory cleared immediately before choosing A/B:
+
+```bash
+python3 overcookedv2/run_toy.py --reset-before-decision
+python3 overcookedv2/run_toy.py --actor-type transformer --reset-before-decision
+```
+
+Both conditions use the same fresh episodes, decision observations, previous
+actions/rewards, and random action draws. The GRU hidden state is cleared; the
+Transformer loses earlier context while keeping the decision's time position.
+Training is unchanged. The comparison prints mean return and the mean probability
+of the correct answer, and is saved under `memory_reset` in the checkpoint.
+
 ## Complete toy experiment
 
 ```bash
@@ -668,6 +682,10 @@ per-episode returns, and the shared train/test IDs. Representations are saved
 after processing the decision observation and before the final action/reward.
 Final feedback and the late terminal clue are excluded from diagnostic inputs.
 Separate diagnostic seeds avoid reusing PPO training episodes.
+
+`toy_experiment.py` also accepts `--reset-before-decision`. It uses the helper in
+`run_toy.py` to compare both conditions over all diagnostic episodes, then saves
+the comparison under `memory_reset` in both `results.json` and `experiment.pt`.
 
 To access the saved representations from Python:
 

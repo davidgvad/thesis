@@ -9,7 +9,7 @@ from torch.distributions import Categorical
 
 from models import GRUActor, TransformerActor, CentralCritic
 from ppo import compute_gae
-from toy_pomdp import MemoryPOMDP
+from toy_pomdp import MemoryPOMDP, WAIT
 
 
 def train_toy(env, updates=30, num_steps=200, actor_type="gru", context_length=400):
@@ -141,6 +141,55 @@ def train_toy(env, updates=30, num_steps=200, actor_type="gru", context_length=4
     return actor, critic, history
 
 
+@torch.no_grad()
+def evaluate_memory_reset(actor, env):
+    """Compare intact and cleared memory on the same fresh A/B decisions."""
+    was_training = actor.training
+    actor.eval()
+    state = env.reset()
+    previous_action = torch.zeros(env.batch_size, dtype=torch.long, device=env.device)
+    previous_reward = torch.zeros(env.batch_size, device=env.device)
+    starts = torch.ones(env.batch_size, dtype=torch.bool, device=env.device)
+    hidden = None
+
+    # Follow the normal policy until just before the final choice.
+    for _ in range(env.decision_step):
+        _, hidden = actor(env.get_obs(state), previous_action, previous_reward, hidden, starts)
+        action = torch.full_like(previous_action, WAIT)  # Forced before the choice.
+        state, _, previous_reward, starts = env.step(state, action)
+        previous_action = action
+
+    obs = env.get_obs(state)
+    normal_logits, _ = actor(obs, previous_action, previous_reward, hidden, starts)
+    reset_hidden = None  # A GRU starts with a zero hidden state.
+    if isinstance(hidden, dict):
+        # Transformer: remove old inputs, but keep the current timestep's position.
+        reset_hidden = {
+            key: value[:, :0] for key, value in hidden.items()
+            if key not in ("next_position", "representation")
+        }
+        reset_hidden["next_position"] = hidden["next_position"]
+    reset_logits, _ = actor(obs, previous_action, previous_reward, reset_hidden, starts)
+
+    # Use the same random draw for both A/B choices to make a paired comparison.
+    draw = torch.rand(env.batch_size, device=env.device)
+    batch = torch.arange(env.batch_size, device=env.device)
+    results = {"episodes": env.batch_size}
+    print(f"\nFrozen memory comparison ({env.batch_size} episodes)", flush=True)
+    for name, logits in (("intact", normal_logits), ("reset", reset_logits)):
+        probabilities = logits[:, :2].softmax(dim=-1)
+        action = (draw >= probabilities[:, 0]).long()
+        _, _, reward, _ = env.step(state, action)
+        results[name] = {
+            "mean_return": reward.mean().item(),
+            "mean_correct_probability": probabilities[batch, state.condition].mean().item(),
+        }
+        print(f"  {name:6s} | Mean return {results[name]['mean_return']:.3f}"
+              f" | P(correct) {results[name]['mean_correct_probability']:.3f}", flush=True)
+    actor.train(was_training)
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -148,6 +197,8 @@ def main():
     parser.add_argument("--updates", type=int, default=30)
     parser.add_argument("--actor-type", choices=("gru", "transformer"), default="gru")
     parser.add_argument("--context-length", type=int, default=400)
+    parser.add_argument("--reset-before-decision", action="store_true",
+                        help="After training, compare frozen performance with and without memory.")
     parser.add_argument("--delay-steps", type=int, default=5)
     parser.add_argument("--clue-timing", choices=("early", "late"), default="early")
     parser.add_argument("--clue-accuracy", type=float, default=1.0)
@@ -168,9 +219,15 @@ def main():
         env, updates=args.updates, num_steps=args.num_steps,
         actor_type=args.actor_type, context_length=args.context_length,
     )
+    memory_reset = None
+    if args.reset_before_decision:
+        env.generator.manual_seed(args.seed + 10000)
+        torch.manual_seed(args.seed + 20000)
+        memory_reset = evaluate_memory_reset(actor, env)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "actor": actor.state_dict(), "critic": critic.state_dict(), "history": history,
+        "memory_reset": memory_reset,
         "settings": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
     }, args.output)
     print(f"Saved actor and critic to {args.output}")
