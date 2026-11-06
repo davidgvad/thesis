@@ -461,3 +461,96 @@ workers), then `train.py` (create DDP wrappers and combine logging), then
 `ppo.py` (global advantage normalization and the usual PPO updates). During
 rollout collection each worker uses its local model directly; gradients are
 synchronized only during training updates.
+
+## Controlled memory POMDP
+
+`overcookedv2/toy_pomdp.py` is a separate batched environment for checking memory
+diagnostics. Its default episode has four blank steps, one A/B clue, five blank
+delay steps, then one A/B decision (11 transitions). Only WAIT is legal before
+the decision. A correct decision earns 1; all other rewards are 0.
+
+```bash
+python3 overcookedv2/toy_pomdp.py
+python3 overcookedv2/toy_pomdp.py --clue-accuracy 0.9
+python3 overcookedv2/toy_pomdp.py --clue-timing late
+python3 -m unittest discover -s overcookedv2 -p 'test_toy_pomdp.py' -v
+```
+
+The command prints a scripted remembering-policy check, not neural training.
+With a reliable early clue its expected return is 1; with a 90% reliable clue
+it is 0.9. In late mode the clue is revealed only in the terminal observation,
+after the final action, so the best achievable expected return is 0.5.
+
+`reset()` returns a `MemoryState`. Give the actor only `get_obs(state)` ([B,3]),
+never the hidden `condition` or `clue` fields. `action_mask(state)` marks legal
+actions; mask other policy logits to negative infinity. Actions are A=0, B=1,
+WAIT=2. `step(state, actions)` returns `(next_state, next_obs, reward, done)`.
+After completion, explicitly call `reset()` and clear policy memory.
+
+This adds the environment and sanity checks only. GRU/Transformer training,
+probes, and agent memory/action-use failure interventions are separate work;
+the existing Overcooked training entry point is unchanged.
+
+## History-information classifier
+
+`overcookedv2/history_classifier.py` is a separate supervised diagnostic. It
+predicts the appropriate response label from the legal history before a decision
+and compares this with a current-observation-only classifier. It does not update
+the ego, use its hidden state, or run PPO.
+
+```bash
+python3 overcookedv2/history_classifier.py
+python3 overcookedv2/history_classifier.py --clue-timing late --output runs/history_late
+python3 overcookedv2/history_classifier.py --clue-accuracy 0.9 --output runs/history_noisy
+```
+
+The first command generates toy episodes, splits by episode ID, and trains both
+classifiers for a fixed 10 epochs. It evaluates the held-out split afterward.
+Default results go to `runs/history_classifier/results.json`, with separate
+model checkpoints and training-loss files. Existing output folders are rejected
+to avoid overwriting a run. Use `--device cuda:0` for one GPU.
+
+History inputs use `[T,B,...]`, matching the policy code. `lengths[B]` counts
+observations through each decision observation, before choosing the action.
+Later/padded entries are excluded before encoding and by attention masks. The
+first previous action/reward is ignored because it precedes the episode.
+The baseline receives only the final legal observation, including no previous
+action or reward. A fresh MLP encodes toy vectors; a fresh CNNEncoder encodes
+Overcooked legal grids. The history module uses one 128-wide Transformer block,
+four heads, a 128-wide ReLU feed-forward layer, fixed positions, and no dropout.
+These are initial settings, not validated Overcooked classifier hyperparameters.
+
+For Overcooked, save a `.pt` dictionary with these six tensor fields:
+
+```text
+obs                 [T,N,H,W,C]  legal ego observations (toy: [T,N,F])
+previous_action     [T,N]        torch.long; action before each observation
+previous_reward     [T,N]        reward before each observation
+lengths             [N]          torch.long; last legal index plus one
+labels              [N]          torch.long; appropriate response class, 0..K-1
+episode_ids         [N]          torch.long; globally unique source episode IDs
+```
+
+N is the number of labelled decision examples. Each prefix starts at an episode
+boundary; include the full legal history through that decision, not a rollout
+chunk that starts mid-episode. Pad shorter prefixes to T and set their lengths.
+Multiple examples from one episode must share an episode ID so they stay in the
+same split. Labels are targets only. Never include the decision action, its
+reward, privileged critic inputs, or a clue revealed after the decision.
+
+```bash
+python3 overcookedv2/history_classifier.py --data-file legal_histories.pt \
+    --device cuda:0 --output runs/overcooked_history_classifier
+python3 -m unittest discover -s overcookedv2 -p 'test_history_classifier.py' -v
+```
+
+Overcooked history collection and response labels still need the chosen task
+and verified response groups; this file supplies the reusable classifier and
+training/evaluation functions. Toy success checks the implementation, not
+Overcooked reliability. Poor classifier accuracy does not prove information was
+unavailable. This classifier is separate from the proposed linear memory probe.
+
+For claims about unfamiliar teammate variants, also keep teammate variants
+disjoint between classifier training and testing. Episode-ID splitting alone
+does not enforce that; use `fit_classifier` and `evaluate_classifier` on the
+separately prepared datasets.
